@@ -1,0 +1,8 @@
+# Give the board a static IP over the USB serial console when DHCP does not answer.
+# It lasts until the next reboot (nothing is written to flash). Run:
+#   py C:\Users\mizuk\esp32s3-linux\tools\ttyshell.py COM23 C:\Users\mizuk\esp32s3-linux\secrets\board-root-password.txt --timeout 40 --cmdfile C:\Users\mizuk\esp32s3-linux\tools\serial_static_ip.cmds
+# 192.168.0.8 is the address the board has had from the router so far; change it if that is taken.
+killall udhcpc
+ifconfig espsta0 192.168.0.8 netmask 255.255.255.0 up
+route add default gw 192.168.0.1
+ping -c 3 -W 2 192.168.0.1

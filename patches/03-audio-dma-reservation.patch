@@ -1,0 +1,18 @@
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c
++++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c
+@@ -57,3 +57,4 @@
+-static char IRAM_ATTR space_for_vectors[4096] __attribute__((aligned(4096)));
++/* First page for Linux vectors, second page for the Linux GDMA descriptor pool. */
++static char IRAM_ATTR space_for_vectors[8192] __attribute__((aligned(4096)));
+ 
+ #define N_TAGS (3 + CMDLINE_MAX / sizeof(struct bp_tag))
+@@ -86,5 +87,8 @@
+ 	printf("linux ptr = %p\n", linux);
+ 	printf("vectors ptr = %p\n", space_for_vectors);
++	printf("gdma ptr = %p\n", space_for_vectors + 4096);
++	memset(space_for_vectors + 4096, 0, 4096);
++	*(volatile unsigned int *)(space_for_vectors + 4096) = 0x54444543;
+ 
+ 	extern int g_abort_on_ipc;
+ 	g_abort_on_ipc = 1;

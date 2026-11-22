@@ -1,0 +1,853 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Framebuffer driver for AMOLED panels with a Quad-SPI interface and an
+ * SH8601 or CO5300 controller, such as the 466x466 panel of the Waveshare
+ * ESP32-S3-Touch-AMOLED-1.43.
+ *
+ * Bus protocol (SH8601Z datasheet, "Quad SPI Interface"; chip select stays
+ * low for a whole frame):
+ *
+ *   register write   02h, 00h, <cmd>, 00h, <parameters>            (1 line)
+ *   pixel write      32h, 00h, 2Ch (first) / 3Ch (continue), 00h,
+ *                    <RGB565, high byte first>                      (header on
+ *                                                  1 line, pixels on 4 lines)
+ *
+ * With "pixel-wires = 1" the pixels use the 02h opcode and a single line, a
+ * slow path that is handy when bringing up new wiring.
+ *
+ * The framebuffer lives in RAM; drawing marks the touched rectangle dirty and a
+ * delayed work sends that rectangle to the panel. The controller wants write
+ * windows that start on even and end on odd coordinates, so rectangles are
+ * widened to that grid first.
+ */
+
+#include <linux/ctype.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/fb.h>
+#include <linux/gfp.h>
+#include <linux/gpio/consumer.h>
+#include <linux/kernel.h>
+#include <linux/ktime.h>
+#include <linux/mm.h>
+#include <linux/mod_devicetable.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/property.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/spi/spi.h>
+#include <linux/spinlock.h>
+#include <linux/swab.h>
+#include <linux/workqueue.h>
+
+#define AMOLED_OP_WRITE_REG	0x02
+#define AMOLED_OP_WRITE_PIX4	0x32
+
+#define AMOLED_CMD_SLPIN	0x10
+#define AMOLED_CMD_SLPOUT	0x11
+#define AMOLED_CMD_DISPOFF	0x28
+#define AMOLED_CMD_DISPON	0x29
+#define AMOLED_CMD_CASET	0x2a
+#define AMOLED_CMD_RASET	0x2b
+#define AMOLED_CMD_RAMWR	0x2c
+#define AMOLED_CMD_MADCTL	0x36
+#define AMOLED_CMD_COLMOD	0x3a
+#define AMOLED_CMD_RAMWRC	0x3c
+#define AMOLED_CMD_WRDISBV	0x51
+
+#define AMOLED_TXBUF_SIZE	4096
+#define AMOLED_MAX_PARAMS	4
+#define AMOLED_PANEL_SIZE	466	/* pixels per side of the glass */
+
+static unsigned int flush_delay_ms = 20;
+module_param(flush_delay_ms, uint, 0644);
+MODULE_PARM_DESC(flush_delay_ms, "Wait this long after drawing before updating the panel");
+
+/* writable at run time through /sys/module/amoled_qspi_fb/parameters */
+static unsigned int pixel_wires;
+module_param(pixel_wires, uint, 0644);
+MODULE_PARM_DESC(pixel_wires, "Force 1 or 4 pixel lines (0: as the devicetree says)");
+
+struct amoled_cmd {
+	u8 cmd;
+	u8 len;
+	u8 data[AMOLED_MAX_PARAMS];
+	u16 delay_ms;
+};
+
+struct amoled_variant {
+	const char *name;
+	const struct amoled_cmd *pre;	/* before the first pixels reach the panel */
+	unsigned int n_pre;
+	const struct amoled_cmd *post;	/* display on, brightness */
+	unsigned int n_post;
+	u16 x_offset;			/* panel columns left of the first pixel */
+};
+
+/* From the vendor demo (Waveshare ESP32-S3-AMOLED-1.43-Demo, example_qspi_with_ram.c) */
+static const struct amoled_cmd co5300_pre[] = {
+	{ AMOLED_CMD_SLPOUT, 0, { 0 }, 80 },
+	{ 0xc4, 1, { 0x80 }, 0 },		/* SPI_MODE: Quad-SPI */
+	{ 0x53, 1, { 0x20 }, 1 },		/* WRCTRLD: brightness control on */
+	{ 0x63, 1, { 0xff }, 1 },		/* HBM brightness */
+	{ AMOLED_CMD_WRDISBV, 1, { 0x00 }, 1 },
+};
+static const struct amoled_cmd co5300_post[] = {
+	{ AMOLED_CMD_DISPON, 0, { 0 }, 10 },
+};
+static const struct amoled_variant co5300_variant = {
+	.name = "CO5300",
+	.pre = co5300_pre,	.n_pre = ARRAY_SIZE(co5300_pre),
+	.post = co5300_post,	.n_post = ARRAY_SIZE(co5300_post),
+	.x_offset = 6,
+};
+
+static const struct amoled_cmd sh8601_pre[] = {
+	{ AMOLED_CMD_SLPOUT, 0, { 0 }, 120 },
+	{ 0x44, 2, { 0x01, 0xd1 }, 0 },		/* tear scan line */
+	{ 0x35, 1, { 0x00 }, 0 },		/* tearing effect on */
+	{ 0x53, 1, { 0x20 }, 10 },		/* WRCTRLD: brightness control on */
+	{ AMOLED_CMD_WRDISBV, 1, { 0x00 }, 10 },
+};
+static const struct amoled_cmd sh8601_post[] = {
+	{ AMOLED_CMD_DISPON, 0, { 0 }, 10 },
+};
+static const struct amoled_variant sh8601_variant = {
+	.name = "SH8601",
+	.pre = sh8601_pre,	.n_pre = ARRAY_SIZE(sh8601_pre),
+	.post = sh8601_post,	.n_post = ARRAY_SIZE(sh8601_post),
+	.x_offset = 0,
+};
+
+struct amoled_fb {
+	struct spi_device *spi;
+	struct fb_info *info;
+	const struct amoled_variant *variant;
+	struct gpio_desc *reset;
+	struct gpio_desc *enable;
+
+	u32 width, height;
+	u32 x_offset, y_offset;
+	unsigned int pix_wires;		/* 4 or 1 */
+	u8 brightness;
+	bool display_on;
+
+	struct mutex io_lock;		/* the SPI device, the buffers below */
+	u8 hdr[4];
+	u8 params[AMOLED_MAX_PARAMS];
+	u8 *txbuf;
+
+	struct delayed_work flush_work;
+	spinlock_t dirty_lock;		/* the dirty rectangle */
+	bool dirty;
+	u32 dx1, dy1, dx2, dy2;
+
+	u32 palette[16];
+
+	/* the last panel update, for /sys/.../flush_stats */
+	u32 flushes;
+	u32 last_flush_us;
+	u32 last_flush_px;
+	u32 max_flush_us;	/* of the largest update so far */
+	u32 max_flush_px;
+};
+
+/* --- bus -------------------------------------------------------------- */
+
+static int amoled_write_reg(struct amoled_fb *par, u8 cmd, const u8 *data,
+			    size_t len)
+{
+	struct spi_transfer xfers[2] = { };
+
+	par->hdr[0] = AMOLED_OP_WRITE_REG;
+	par->hdr[1] = 0;
+	par->hdr[2] = cmd;
+	par->hdr[3] = 0;
+	xfers[0].tx_buf = par->hdr;
+	xfers[0].len = 4;
+	if (len) {
+		memcpy(par->params, data, len);
+		xfers[1].tx_buf = par->params;
+		xfers[1].len = len;
+	}
+	return spi_sync_transfer(par->spi, xfers, len ? 2 : 1);
+}
+
+static unsigned int amoled_wires(const struct amoled_fb *par)
+{
+	if (pixel_wires == 1 || !(par->spi->mode & SPI_TX_QUAD))
+		return 1;
+	if (pixel_wires == 4)
+		return 4;
+	return par->pix_wires;
+}
+
+static int amoled_write_pixels(struct amoled_fb *par, bool first, size_t len)
+{
+	struct spi_transfer xfers[2] = { };
+	bool quad = amoled_wires(par) == 4;
+
+	par->hdr[0] = quad ? AMOLED_OP_WRITE_PIX4 : AMOLED_OP_WRITE_REG;
+	par->hdr[1] = 0;
+	par->hdr[2] = first ? AMOLED_CMD_RAMWR : AMOLED_CMD_RAMWRC;
+	par->hdr[3] = 0;
+	xfers[0].tx_buf = par->hdr;
+	xfers[0].len = 4;
+	xfers[1].tx_buf = par->txbuf;
+	xfers[1].len = len;
+	xfers[1].tx_nbits = quad ? SPI_NBITS_QUAD : SPI_NBITS_SINGLE;
+	return spi_sync_transfer(par->spi, xfers, 2);
+}
+
+static int amoled_run_cmds(struct amoled_fb *par, const struct amoled_cmd *cmds,
+			   unsigned int n)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < n; i++) {
+		ret = amoled_write_reg(par, cmds[i].cmd, cmds[i].data,
+				       cmds[i].len);
+		if (ret)
+			return ret;
+		if (cmds[i].delay_ms)
+			msleep(cmds[i].delay_ms);
+	}
+	return 0;
+}
+
+/* Window in panel (controller) coordinates. */
+static int amoled_set_window_raw(struct amoled_fb *par, u32 x1, u32 y1, u32 x2,
+				 u32 y2)
+{
+	u8 p[4];
+	int ret;
+
+	p[0] = x1 >> 8;
+	p[1] = x1;
+	p[2] = x2 >> 8;
+	p[3] = x2;
+	ret = amoled_write_reg(par, AMOLED_CMD_CASET, p, 4);
+	if (ret)
+		return ret;
+
+	p[0] = y1 >> 8;
+	p[1] = y1;
+	p[2] = y2 >> 8;
+	p[3] = y2;
+	return amoled_write_reg(par, AMOLED_CMD_RASET, p, 4);
+}
+
+/* Window in framebuffer coordinates. */
+static int amoled_set_window(struct amoled_fb *par, u32 x1, u32 y1, u32 x2,
+			     u32 y2)
+{
+	return amoled_set_window_raw(par, x1 + par->x_offset, y1 + par->y_offset,
+				     x2 + par->x_offset, y2 + par->y_offset);
+}
+
+/*
+ * Black out the whole glass. The framebuffer may be smaller than the panel (a
+ * console that fits inside a round one), and the frame memory is not cleared by
+ * the reset: what the framebuffer does not cover would light up as noise.
+ * Caller holds io_lock.
+ */
+static int amoled_clear_panel(struct amoled_fb *par)
+{
+	const u32 x1 = par->variant->x_offset;
+	size_t left = AMOLED_PANEL_SIZE * AMOLED_PANEL_SIZE * 2;
+	bool first = true;
+	int ret;
+
+	ret = amoled_set_window_raw(par, x1, 0, x1 + AMOLED_PANEL_SIZE - 1,
+				    AMOLED_PANEL_SIZE - 1);
+	if (ret)
+		return ret;
+
+	memset(par->txbuf, 0, AMOLED_TXBUF_SIZE);
+	while (left) {
+		size_t n = min_t(size_t, left, AMOLED_TXBUF_SIZE);
+
+		ret = amoled_write_pixels(par, first, n);
+		if (ret)
+			return ret;
+		first = false;
+		left -= n;
+		cond_resched();
+	}
+	return 0;
+}
+
+/* Send a rectangle of the framebuffer to the panel. Caller holds io_lock. */
+static int amoled_send_rect(struct amoled_fb *par, u32 x1, u32 y1, u32 x2,
+			    u32 y2)
+{
+	const u8 *vmem = par->info->screen_buffer;
+	const u32 stride = par->info->fix.line_length;
+	size_t fill = 0;
+	bool first = true;
+	u32 y;
+	int ret;
+
+	/* the controller needs even start and odd end coordinates */
+	x1 &= ~1u;
+	y1 &= ~1u;
+	x2 |= 1u;
+	y2 |= 1u;
+	if (x2 >= par->width)
+		x2 = par->width - 1;
+	if (y2 >= par->height)
+		y2 = par->height - 1;
+
+	par->last_flush_px = (x2 - x1 + 1) * (y2 - y1 + 1);
+
+	ret = amoled_set_window(par, x1, y1, x2, y2);
+	if (ret)
+		return ret;
+
+	for (y = y1; y <= y2; y++) {
+		const u16 *src = (const u16 *)(vmem + y * stride) + x1;
+		u32 left = x2 - x1 + 1;
+
+		while (left) {
+			u32 n = min_t(u32, left, (AMOLED_TXBUF_SIZE - fill) / 2);
+			u16 *dst = (u16 *)(par->txbuf + fill);
+			u32 i;
+
+			/* the panel takes the high byte of each pixel first */
+			for (i = 0; i < n; i++)
+				dst[i] = swab16(src[i]);
+			src += n;
+			left -= n;
+			fill += n * 2;
+
+			if (fill == AMOLED_TXBUF_SIZE) {
+				ret = amoled_write_pixels(par, first, fill);
+				if (ret)
+					return ret;
+				first = false;
+				fill = 0;
+				cond_resched();
+			}
+		}
+	}
+	if (fill)
+		ret = amoled_write_pixels(par, first, fill);
+	return ret;
+}
+
+/* --- drawing ---------------------------------------------------------- */
+
+static void amoled_damage(struct amoled_fb *par, int x, int y, int w, int h)
+{
+	unsigned long flags;
+	int x2 = x + w - 1;
+	int y2 = y + h - 1;
+
+	if (x < 0)
+		x = 0;
+	if (y < 0)
+		y = 0;
+	if (x2 >= (int)par->width)
+		x2 = par->width - 1;
+	if (y2 >= (int)par->height)
+		y2 = par->height - 1;
+	if (x2 < x || y2 < y)
+		return;
+
+	spin_lock_irqsave(&par->dirty_lock, flags);
+	if (!par->dirty) {
+		par->dx1 = x;
+		par->dy1 = y;
+		par->dx2 = x2;
+		par->dy2 = y2;
+		par->dirty = true;
+	} else {
+		par->dx1 = min_t(u32, par->dx1, x);
+		par->dy1 = min_t(u32, par->dy1, y);
+		par->dx2 = max_t(u32, par->dx2, x2);
+		par->dy2 = max_t(u32, par->dy2, y2);
+	}
+	spin_unlock_irqrestore(&par->dirty_lock, flags);
+
+	schedule_delayed_work(&par->flush_work, msecs_to_jiffies(flush_delay_ms));
+}
+
+static void amoled_flush_work(struct work_struct *work)
+{
+	struct amoled_fb *par = container_of(to_delayed_work(work),
+					     struct amoled_fb, flush_work);
+	unsigned long flags;
+	u32 x1, y1, x2, y2;
+	ktime_t t0;
+	int ret;
+
+	spin_lock_irqsave(&par->dirty_lock, flags);
+	if (!par->dirty) {
+		spin_unlock_irqrestore(&par->dirty_lock, flags);
+		return;
+	}
+	x1 = par->dx1;
+	y1 = par->dy1;
+	x2 = par->dx2;
+	y2 = par->dy2;
+	par->dirty = false;
+	spin_unlock_irqrestore(&par->dirty_lock, flags);
+
+	t0 = ktime_get();
+	mutex_lock(&par->io_lock);
+	ret = amoled_send_rect(par, x1, y1, x2, y2);
+	mutex_unlock(&par->io_lock);
+	par->last_flush_us = ktime_to_us(ktime_sub(ktime_get(), t0));
+	par->flushes++;
+	if (par->last_flush_px >= par->max_flush_px) {
+		par->max_flush_px = par->last_flush_px;
+		par->max_flush_us = par->last_flush_us;
+	}
+	if (ret)
+		dev_err_ratelimited(&par->spi->dev, "panel update failed: %d\n",
+				    ret);
+}
+
+/* --- fb_ops ----------------------------------------------------------- */
+
+static void amoled_fb_fillrect(struct fb_info *info,
+			       const struct fb_fillrect *rect)
+{
+	sys_fillrect(info, rect);
+	amoled_damage(info->par, rect->dx, rect->dy, rect->width, rect->height);
+}
+
+static void amoled_fb_copyarea(struct fb_info *info,
+			       const struct fb_copyarea *area)
+{
+	sys_copyarea(info, area);
+	amoled_damage(info->par, area->dx, area->dy, area->width, area->height);
+}
+
+static void amoled_fb_imageblit(struct fb_info *info,
+				const struct fb_image *image)
+{
+	sys_imageblit(info, image);
+	amoled_damage(info->par, image->dx, image->dy, image->width,
+		      image->height);
+}
+
+static ssize_t amoled_fb_write(struct fb_info *info, const char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	struct amoled_fb *par = info->par;
+	ssize_t ret = fb_sys_write(info, buf, count, ppos);
+
+	if (ret > 0)
+		amoled_damage(par, 0, 0, par->width, par->height);
+	return ret;
+}
+
+static int amoled_fb_check_var(struct fb_var_screeninfo *var,
+			       struct fb_info *info)
+{
+	/* one fixed mode: keep what the caller may change, force the rest */
+	var->xres = info->var.xres;
+	var->yres = info->var.yres;
+	var->xres_virtual = info->var.xres_virtual;
+	var->yres_virtual = info->var.yres_virtual;
+	var->xoffset = 0;
+	var->yoffset = 0;
+	var->bits_per_pixel = info->var.bits_per_pixel;
+	var->grayscale = 0;
+	var->nonstd = 0;
+	var->red = info->var.red;
+	var->green = info->var.green;
+	var->blue = info->var.blue;
+	var->transp = info->var.transp;
+	return 0;
+}
+
+static int amoled_fb_setcolreg(unsigned int regno, unsigned int red,
+			       unsigned int green, unsigned int blue,
+			       unsigned int transp, struct fb_info *info)
+{
+	u32 *pal = info->pseudo_palette;
+
+	if (regno >= 16)
+		return -EINVAL;
+	pal[regno] = ((red >> 11) << 11) | ((green >> 10) << 5) | (blue >> 11);
+	return 0;
+}
+
+static int amoled_fb_blank(int blank, struct fb_info *info)
+{
+	struct amoled_fb *par = info->par;
+	bool on = blank == FB_BLANK_UNBLANK;
+	int ret;
+
+	mutex_lock(&par->io_lock);
+	ret = amoled_write_reg(par, on ? AMOLED_CMD_DISPON : AMOLED_CMD_DISPOFF,
+			       NULL, 0);
+	if (!ret)
+		par->display_on = on;
+	mutex_unlock(&par->io_lock);
+	return ret;
+}
+
+static const struct fb_ops amoled_fb_ops = {
+	.owner		= THIS_MODULE,
+	.fb_read	= fb_sys_read,
+	.fb_write	= amoled_fb_write,
+	.fb_check_var	= amoled_fb_check_var,
+	.fb_setcolreg	= amoled_fb_setcolreg,
+	.fb_blank	= amoled_fb_blank,
+	.fb_fillrect	= amoled_fb_fillrect,
+	.fb_copyarea	= amoled_fb_copyarea,
+	.fb_imageblit	= amoled_fb_imageblit,
+};
+
+/* --- panel ------------------------------------------------------------ */
+
+static int amoled_panel_init(struct amoled_fb *par)
+{
+	const struct amoled_variant *v = par->variant;
+	int ret;
+
+	gpiod_set_value_cansleep(par->enable, 1);
+	msleep(20);
+
+	gpiod_set_value_cansleep(par->reset, 1);	/* assert: pin low */
+	msleep(10);
+	gpiod_set_value_cansleep(par->reset, 0);
+	msleep(150);
+
+	mutex_lock(&par->io_lock);
+
+	/* RGB order, 16 bits per pixel; the vendor driver sends these first */
+	ret = amoled_write_reg(par, AMOLED_CMD_MADCTL, (const u8 []){ 0x00 }, 1);
+	if (!ret)
+		ret = amoled_write_reg(par, AMOLED_CMD_COLMOD,
+				       (const u8 []){ 0x55 }, 1);
+	if (!ret)
+		ret = amoled_run_cmds(par, v->pre, v->n_pre);
+
+	/* fill the panel's frame memory (black at probe) before it lights up */
+	if (!ret)
+		ret = amoled_clear_panel(par);
+	if (!ret)
+		ret = amoled_send_rect(par, 0, 0, par->width - 1,
+				       par->height - 1);
+	if (!ret)
+		ret = amoled_run_cmds(par, v->post, v->n_post);
+	if (!ret)
+		ret = amoled_write_reg(par, AMOLED_CMD_WRDISBV, &par->brightness, 1);
+	if (!ret)
+		par->display_on = true;
+
+	mutex_unlock(&par->io_lock);
+	return ret;
+}
+
+static void amoled_panel_off(struct amoled_fb *par)
+{
+	mutex_lock(&par->io_lock);
+	amoled_write_reg(par, AMOLED_CMD_DISPOFF, NULL, 0);
+	msleep(20);
+	amoled_write_reg(par, AMOLED_CMD_SLPIN, NULL, 0);
+	msleep(120);
+	mutex_unlock(&par->io_lock);
+	gpiod_set_value_cansleep(par->enable, 0);
+}
+
+/* --- sysfs ------------------------------------------------------------ */
+
+static ssize_t brightness_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", par->brightness);
+}
+
+static ssize_t brightness_store(struct device *dev,
+				struct device_attribute *attr, const char *buf,
+				size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	u8 val;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	mutex_lock(&par->io_lock);
+	ret = amoled_write_reg(par, AMOLED_CMD_WRDISBV, &val, 1);
+	if (!ret)
+		par->brightness = val;
+	mutex_unlock(&par->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(brightness);
+
+/* echo 1 > refresh: send the whole framebuffer to the panel again */
+static ssize_t refresh_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+
+	amoled_damage(par, 0, 0, par->width, par->height);
+	return count;
+}
+static DEVICE_ATTR_WO(refresh);
+
+/* echo 1 > reinit: power the panel up again and run its init sequence */
+static ssize_t reinit_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	int ret = amoled_panel_init(par);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(reinit);
+
+/*
+ * echo "23" > cmd        all pixels on (no pixel data needed: tests power,
+ *                        reset and the register path alone)
+ * echo "13" > cmd        back to normal display
+ * echo "51 80" > cmd     register 0x51 with one parameter, all values hex
+ */
+static ssize_t cmd_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	u8 b[1 + AMOLED_MAX_PARAMS];
+	unsigned int n = 0;
+	const char *p = buf;
+	int ret;
+
+	while (n < ARRAY_SIZE(b)) {
+		char tok[3] = { };
+		unsigned long v;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!isxdigit(*p))
+			break;
+		tok[0] = *p++;
+		if (isxdigit(*p))
+			tok[1] = *p++;
+		if (kstrtoul(tok, 16, &v))
+			return -EINVAL;
+		b[n++] = v;
+	}
+	if (!n)
+		return -EINVAL;
+
+	mutex_lock(&par->io_lock);
+	ret = amoled_write_reg(par, b[0], b + 1, n - 1);
+	mutex_unlock(&par->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(cmd);
+
+static ssize_t flush_stats_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u flushes; last %u px in %u us; largest %u px in %u us\n",
+			  par->flushes, par->last_flush_px, par->last_flush_us,
+			  par->max_flush_px, par->max_flush_us);
+}
+static DEVICE_ATTR_RO(flush_stats);
+
+static struct attribute *amoled_attrs[] = {
+	&dev_attr_brightness.attr,
+	&dev_attr_refresh.attr,
+	&dev_attr_reinit.attr,
+	&dev_attr_cmd.attr,
+	&dev_attr_flush_stats.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(amoled);
+
+/* --- driver ----------------------------------------------------------- */
+
+static int amoled_fb_probe(struct spi_device *spi)
+{
+	struct device *dev = &spi->dev;
+	const struct amoled_variant *variant;
+	struct fb_info *info;
+	struct amoled_fb *par;
+	size_t len;
+	void *vmem;
+	u32 val;
+	int ret;
+
+	variant = spi_get_device_match_data(spi);
+	if (!variant)
+		return -ENODEV;
+
+	info = framebuffer_alloc(sizeof(*par), dev);
+	if (!info)
+		return -ENOMEM;
+	par = info->par;
+	par->info = info;
+	par->spi = spi;
+	par->variant = variant;
+	par->width = 466;
+	par->height = 466;
+	par->x_offset = variant->x_offset;
+	par->y_offset = 0;
+	par->brightness = 0xff;
+	mutex_init(&par->io_lock);
+	spin_lock_init(&par->dirty_lock);
+	INIT_DELAYED_WORK(&par->flush_work, amoled_flush_work);
+
+	if (!device_property_read_u32(dev, "width", &val))
+		par->width = val;
+	if (!device_property_read_u32(dev, "height", &val))
+		par->height = val;
+	if (!device_property_read_u32(dev, "x-offset", &val))
+		par->x_offset = val;
+	if (!device_property_read_u32(dev, "y-offset", &val))
+		par->y_offset = val;
+	if (!par->width || !par->height || (par->width | par->height) & 1) {
+		dev_err(dev, "width and height must be even and non-zero\n");
+		ret = -EINVAL;
+		goto err_release;
+	}
+
+	par->pix_wires = (spi->mode & SPI_TX_QUAD) ? 4 : 1;
+	if (!device_property_read_u32(dev, "pixel-wires", &val) && val == 1)
+		par->pix_wires = 1;
+
+	par->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(par->reset)) {
+		ret = dev_err_probe(dev, PTR_ERR(par->reset), "reset gpio\n");
+		goto err_release;
+	}
+	par->enable = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_LOW);
+	if (IS_ERR(par->enable)) {
+		ret = dev_err_probe(dev, PTR_ERR(par->enable), "enable gpio\n");
+		goto err_release;
+	}
+
+	spi->bits_per_word = 8;
+	ret = spi_setup(spi);
+	if (ret) {
+		dev_err_probe(dev, ret, "spi setup\n");
+		goto err_release;
+	}
+
+	par->txbuf = devm_kmalloc(dev, AMOLED_TXBUF_SIZE, GFP_KERNEL);
+	if (!par->txbuf) {
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	/* One physically contiguous block: there is no MMU to stitch pages. */
+	len = PAGE_ALIGN(par->width * par->height * 2);
+	vmem = alloc_pages_exact(len, GFP_KERNEL | __GFP_ZERO);
+	if (!vmem) {
+		dev_err(dev, "no memory for a %zu byte framebuffer\n", len);
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	info->fbops = &amoled_fb_ops;
+	info->flags = FBINFO_VIRTFB | FBINFO_READS_FAST;
+	info->screen_buffer = vmem;
+	info->screen_size = par->width * par->height * 2;
+	info->pseudo_palette = par->palette;
+
+	strscpy(info->fix.id, "amoled-qspi", sizeof(info->fix.id));
+	info->fix.type = FB_TYPE_PACKED_PIXELS;
+	info->fix.visual = FB_VISUAL_TRUECOLOR;
+	info->fix.line_length = par->width * 2;
+	info->fix.smem_len = info->screen_size;
+
+	info->var.xres = par->width;
+	info->var.yres = par->height;
+	info->var.xres_virtual = par->width;
+	info->var.yres_virtual = par->height;
+	info->var.bits_per_pixel = 16;
+	info->var.red.offset = 11;
+	info->var.red.length = 5;
+	info->var.green.offset = 5;
+	info->var.green.length = 6;
+	info->var.blue.offset = 0;
+	info->var.blue.length = 5;
+	info->var.activate = FB_ACTIVATE_NOW;
+	info->var.vmode = FB_VMODE_NONINTERLACED;
+	info->var.height = -1;
+	info->var.width = -1;
+
+	spi_set_drvdata(spi, par);
+
+	ret = amoled_panel_init(par);
+	if (ret) {
+		dev_err_probe(dev, ret, "panel init\n");
+		goto err_free_vmem;
+	}
+
+	ret = register_framebuffer(info);
+	if (ret) {
+		dev_err_probe(dev, ret, "register framebuffer\n");
+		goto err_panel_off;
+	}
+
+	dev_info(dev, "%s %ux%u (x offset %u), %u-wire pixels, fb%d\n",
+		 variant->name, par->width, par->height, par->x_offset,
+		 par->pix_wires, info->node);
+	return 0;
+
+err_panel_off:
+	amoled_panel_off(par);
+err_free_vmem:
+	free_pages_exact(vmem, len);
+err_release:
+	framebuffer_release(info);
+	return ret;
+}
+
+static void amoled_fb_remove(struct spi_device *spi)
+{
+	struct amoled_fb *par = spi_get_drvdata(spi);
+	struct fb_info *info = par->info;
+
+	unregister_framebuffer(info);
+	cancel_delayed_work_sync(&par->flush_work);
+	amoled_panel_off(par);
+	free_pages_exact(info->screen_buffer, PAGE_ALIGN(info->screen_size));
+	framebuffer_release(info);
+}
+
+static const struct of_device_id amoled_fb_of_match[] = {
+	{ .compatible = "waveshare,amoled-1.43-co5300", .data = &co5300_variant },
+	{ .compatible = "waveshare,amoled-1.43-sh8601", .data = &sh8601_variant },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, amoled_fb_of_match);
+
+static const struct spi_device_id amoled_fb_id[] = {
+	{ "amoled-1.43-co5300", (kernel_ulong_t)&co5300_variant },
+	{ "amoled-1.43-sh8601", (kernel_ulong_t)&sh8601_variant },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, amoled_fb_id);
+
+static struct spi_driver amoled_fb_driver = {
+	.driver = {
+		.name = "amoled-qspi-fb",
+		.of_match_table = amoled_fb_of_match,
+		.dev_groups = amoled_groups,
+	},
+	.id_table = amoled_fb_id,
+	.probe = amoled_fb_probe,
+	.remove = amoled_fb_remove,
+};
+module_spi_driver(amoled_fb_driver);
+
+MODULE_DESCRIPTION("Quad-SPI AMOLED (SH8601/CO5300) framebuffer driver");
+MODULE_LICENSE("GPL");

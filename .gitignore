@@ -1,0 +1,21 @@
+# Build artifacts / downloaded sources (regenerate with build-scripts)
+kernel-work/out/
+kernel-work/ref/
+kernel-work/testimg/
+dl-*/
+images-*/
+build-output/
+logs/
+backup/
+secrets/
+etc-work/
+htop/
+fastfetch/
+screend/
+irq
+
+# Compiled binaries and local build output
+*.bin
+*.o
+*.pyc
+__pycache__/

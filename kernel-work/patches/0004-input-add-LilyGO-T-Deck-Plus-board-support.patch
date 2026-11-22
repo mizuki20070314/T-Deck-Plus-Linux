@@ -1,0 +1,652 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: builder <builder@esp32-repro>
+Date: Wed, 11 Nov 2026 10:18:58 +0900
+Subject: [PATCH 4/4] input: add LilyGO T-Deck Plus board support
+
+Add a T-Deck Plus device tree for the ST7789 display, GT911 touchscreen,
+trackball, GPS UART and peripheral power/CS pins. Add the I2C keyboard MCU
+driver and its binding; the keyboard reports one ASCII character per I2C read.
+---
+ .../keyboard/lilygo,t-deck-keyboard.yaml      |  46 +++
+ arch/xtensa/boot/dts/esp32s3-t-deck-plus.dts  | 282 ++++++++++++++++++
+ drivers/input/keyboard/Kconfig                |  10 +
+ drivers/input/keyboard/Makefile               |   1 +
+ drivers/input/keyboard/tdeck-keyboard.c       | 254 ++++++++++++++++
+ 5 files changed, 593 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/input/keyboard/lilygo,t-deck-keyboard.yaml
+ create mode 100644 arch/xtensa/boot/dts/esp32s3-t-deck-plus.dts
+ create mode 100644 drivers/input/keyboard/tdeck-keyboard.c
+
+diff --git a/Documentation/devicetree/bindings/input/keyboard/lilygo,t-deck-keyboard.yaml b/Documentation/devicetree/bindings/input/keyboard/lilygo,t-deck-keyboard.yaml
+new file mode 100644
+index 000000000..41253a9c0
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/keyboard/lilygo,t-deck-keyboard.yaml
+@@ -0,0 +1,46 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/input/keyboard/lilygo,t-deck-keyboard.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: LilyGO T-Deck I2C keyboard
++
++maintainers:
++  - OpenAI <noreply@openai.com>
++
++description:
++  The T-Deck keyboard is scanned by a separate MCU and reports one ASCII
++  character per I2C read at address 0x55.
++
++properties:
++  compatible:
++    const: lilygo,t-deck-keyboard
++
++  reg:
++    const: 0x55
++
++  poll-interval-ms:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 5
++    maximum: 100
++    default: 10
++
++required:
++  - compatible
++  - reg
++
++additionalProperties: false
++
++examples:
++  - |
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        keyboard@55 {
++            compatible = "lilygo,t-deck-keyboard";
++            reg = <0x55>;
++            poll-interval-ms = <10>;
++        };
++    };
+diff --git a/arch/xtensa/boot/dts/esp32s3-t-deck-plus.dts b/arch/xtensa/boot/dts/esp32s3-t-deck-plus.dts
+new file mode 100644
+index 000000000..714a9a3ea
+--- /dev/null
++++ b/arch/xtensa/boot/dts/esp32s3-t-deck-plus.dts
+@@ -0,0 +1,282 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * LilyGO T-Deck Plus: ESP32-S3FN16R8, 16 MiB flash, 8 MiB PSRAM.
++ *
++ * Board pin assignments are from LilyGO's T-Deck Plus documentation and the
++ * Zephyr t_deck board description. The ST7789 is write-only on SPI2; GPIO10
++ * powers the board peripherals, and GPIO42 is the LCD backlight.
++ */
++/dts-v1/;
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/input/input.h>
++#include "gpio-esp32.h"
++#include "esp32s3.dtsi"
++
++/* GPIO matrix signal numbers, ESP32-S3 TRM table 6-2. */
++#define SIG_FSPICLK	101
++#define SIG_FSPID	103
++#define SIG_FSPICS0	110
++
++/ {
++	model = "LilyGO T-Deck Plus";
++
++	chosen {
++		/* UART0 is wired to the GPS (GPIO43/44), not the serial console.
++		 * Use the ESP32-S3 USB Serial/JTAG ACM port instead. */
++		bootargs = "console=tty0 console=ttyGS3 quiet fbcon=font:VGA8x16 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay ";
++	};
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x3d800000 0x00800000>;
++	};
++
++	/* The touchscreen's rails are always present while GPIO10 enables the
++	 * peripheral domain. These fixed regulators describe the board wiring;
++	 * they do not switch the rails. */
++	touch_avdd28: avdd28-regulator {
++		compatible = "regulator-fixed";
++		regulator-name = "tdeck-touch-avdd28";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		regulator-always-on;
++	};
++
++	touch_vddio: vddio-regulator {
++		compatible = "regulator-fixed";
++		regulator-name = "tdeck-touch-vddio";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++	/* The keyboard is an I2C slave MCU, not a matrix wired to the S3. */
++	i2c0 {
++		#address-cells = <1>;
++		#size-cells = <0>;
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpio0 18 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpio0 8 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		status = "okay";
++
++		keyboard@55 {
++			compatible = "lilygo,t-deck-keyboard";
++			reg = <0x55>;
++			poll-interval-ms = <10>;
++			status = "okay";
++		};
++
++		touchscreen@5d {
++			compatible = "goodix,gt911";
++			reg = <0x5d>;
++			interrupt-parent = <&gpio0>;
++			interrupts = <16 IRQ_TYPE_EDGE_FALLING>;
++			irq-gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;
++			AVDD28-supply = <&touch_avdd28>;
++			VDDIO-supply = <&touch_vddio>;
++			touchscreen-size-x = <240>;
++			touchscreen-size-y = <320>;
++			touchscreen-swapped-x-y;
++			touchscreen-inverted-x;
++			status = "okay";
++		};
++	};
++
++	trackball: trackball {
++		compatible = "gpio-keys";
++		status = "okay";
++
++		trackball-press {
++			label = "Trackball Press";
++			linux,code = <KEY_ENTER>;
++			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
++			debounce-interval = <5>;
++		};
++
++		trackball-up {
++			label = "Trackball Up";
++			linux,code = <KEY_UP>;
++			gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
++			debounce-interval = <2>;
++		};
++
++		trackball-down {
++			label = "Trackball Down";
++			linux,code = <KEY_DOWN>;
++			gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
++			debounce-interval = <2>;
++		};
++
++		trackball-left {
++			label = "Trackball Left";
++			linux,code = <KEY_LEFT>;
++			gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
++			debounce-interval = <2>;
++		};
++
++		trackball-right {
++			label = "Trackball Right";
++			linux,code = <KEY_RIGHT>;
++			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
++			debounce-interval = <2>;
++		};
++	};
++};
++
++&iomux {
++	status = "okay";
++
++	/* Configure GPIOs before gpio-hogs turn on the shared peripheral rail
++	 * and set the inactive CS/backlight levels. */
++	tdeck_gpio_pins: tdeck_gpio_pins {
++		pinctrl-single,pins = <
++			PIN(0)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball press / BOOT */
++			PIN(1)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball left */
++			PIN(2)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball right */
++			PIN(3)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball up */
++			PIN(8)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* I2C SCL */
++			PIN(9)  (FUN_SEL(1) | FUN_DRV_20MA)                  /* LoRa CS, inactive */
++			PIN(10) (FUN_SEL(1) | FUN_DRV_20MA)                  /* peripheral power */
++			PIN(11) (FUN_SEL(1) | FUN_DRV_20MA)                  /* TFT D/C */
++			PIN(15) (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball down */
++			PIN(16) (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* GT911 IRQ */
++			PIN(18) (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* I2C SDA */
++			PIN(39) (FUN_SEL(1) | FUN_DRV_20MA)                  /* SD CS, inactive */
++			PIN(42) (FUN_SEL(1) | FUN_DRV_20MA)                  /* TFT backlight */
++			PIN(46) (FUN_SEL(1) | FUN_IE | FUN_WPU)>;             /* keyboard IRQ (polled protocol) */
++	};
++
++	tdeck_spi2_pins: tdeck_spi2_pins {
++		pinctrl-single,pins = <
++			PIN(12) (FUN_SEL(1) | FUN_DRV_20MA) /* TFT CS */
++			PIN(40) (FUN_SEL(1) | FUN_DRV_40MA) /* SPI SCK */
++			PIN(41) (FUN_SEL(1) | FUN_DRV_40MA)>;/* SPI MOSI */
++	};
++
++	tdeck_uart0_pins: tdeck_uart0_pins {
++		pinctrl-single,pins = <
++			PIN(43) FUN0_20MA         /* GPS TX */
++			PIN(44) FUN0_20MA_IE_WPU>; /* GPS RX */
++	};
++};
++
++&gpio_out_mux {
++	status = "okay";
++
++	tdeck_spi2_out: tdeck_spi2_out {
++		pinctrl-single,pins = <
++			GPIO_FUNC_OUT_SEL(12) SIG_FSPICS0
++			GPIO_FUNC_OUT_SEL(40) SIG_FSPICLK
++			GPIO_FUNC_OUT_SEL(41) SIG_FSPID>;
++	};
++};
++
++&gpio0 {
++	pinctrl-0 = <&tdeck_gpio_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	peripheral-power {
++		gpio-hog;
++		gpios = <10 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "peripheral-power";
++	};
++
++	lora-cs-inactive {
++		gpio-hog;
++		gpios = <9 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "lora-cs-inactive";
++	};
++
++	sd-cs-inactive {
++		gpio-hog;
++		gpios = <39 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "sd-cs-inactive";
++	};
++
++	display-backlight {
++		gpio-hog;
++		gpios = <42 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "display-backlight";
++	};
++};
++
++&uart0 {
++	pinctrl-0 = <&tdeck_uart0_pins>;
++	pinctrl-names = "default";
++	current-speed = <9600>;
++	status = "okay";
++};
++
++&spi2 {
++	pinctrl-0 = <&tdeck_spi2_pins>, <&tdeck_spi2_out>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	display@0 {
++		compatible = "sitronix,st7789v";
++		reg = <0>;
++		spi-max-frequency = <40000000>;
++		buswidth = <8>;
++		/* FBTFT's native geometry is portrait; MADCTL rotates it to the
++		 * T-Deck's 320x240 landscape orientation. */
++		width = <240>;
++		height = <320>;
++		rotate = <270>;
++		dc-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
++		gamma = "D0 0D 14 0D 0D 09 38 44 4E 3A 17 18 2F 30\nD0 09 0F 08 07 14 37 44 4D 38 15 16 2C 3E";
++
++		/* ST7789V initialization for the T-Deck's 320x240 panel, based on
++		 * the Zephyr/LilyGO sequence. FBTFT interprets bit 24 as a
++		 * register write and bit 25 as a millisecond delay. */
++		init = <
++			0x01000001             /* software reset */
++			0x02000005             /* 5 ms */
++			0x01000028             /* display off */
++			0x010000DF 0x5A 0x69 0x02 0x01 /* command-2 enable */
++			0x010000B2 0x0C 0x0C 0x00 0x33 0x33 /* porch */
++			0x010000BA 0x00       /* digital gamma disabled */
++			0x010000C6 0x0F       /* frame rate */
++			0x010000B7 0x75       /* gate control */
++			0x010000BB 0x1A       /* VCOM */
++			0x010000C2 0x01       /* VDV/VRH enable */
++			0x010000C3 0x13       /* VRH */
++			0x010000C4 0x20       /* VDV */
++			0x010000D0 0xA4 0xA1 /* power control */
++			0x0100003A 0x55       /* RGB565 */
++			0x010000C0 0x2C       /* LCM control */
++			0x01000026 0x01       /* gamma curve */
++			0x01000021             /* inversion on */
++			0x010000E0 0xD0 0x0D 0x14 0x0D 0x0D 0x09 0x38
++			           0x44 0x4E 0x3A 0x17 0x18 0x2F 0x30
++			0x010000E1 0xD0 0x09 0x0F 0x08 0x07 0x14 0x37
++			           0x44 0x4D 0x38 0x15 0x16 0x2C 0x3E
++			0x010000B0 0x00 0xF0 /* RAM control */
++			0x010000B1 0x40 0x02 0x14 /* RGB control */
++			0x01000011             /* sleep out */
++			0x02000078             /* 120 ms */
++			0x01000029             /* display on */
++			0x0200000A             /* 10 ms */
++		>;
++	};
++};
++
++&acm {
++	status = "okay";
++};
++
++&ipc {
++	wifi@1 {
++		compatible = "esp,esp32-wifi-shmem";
++		reg = <1>;
++	};
++};
++
++&intc {
++	reg = <0x600c2800 0x800>;
++};
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+index 9d1019ba0..d385f508e 100644
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -262,6 +262,16 @@ config KEYBOARD_GPIO_POLLED
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called gpio_keys_polled.
+ 
++config KEYBOARD_TDECK
++	tristate "LilyGO T-Deck I2C keyboard"
++	depends on I2C
++	help
++	  Say Y here to support the keyboard MCU used by the LilyGO T-Deck and
++	  T-Deck Plus. The MCU returns one ASCII character per I2C read.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called tdeck-keyboard.
++
+ config KEYBOARD_TCA8418
+ 	tristate "TCA8418 Keypad Support"
+ 	depends on I2C
+diff --git a/drivers/input/keyboard/Makefile b/drivers/input/keyboard/Makefile
+index 60bb7baf8..4d5435dd7 100644
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -71,3 +71,4 @@ obj-$(CONFIG_KEYBOARD_TEGRA)		+= tegra-kbc.o
+ obj-$(CONFIG_KEYBOARD_TM2_TOUCHKEY)	+= tm2-touchkey.o
+ obj-$(CONFIG_KEYBOARD_TWL4030)		+= twl4030_keypad.o
+ obj-$(CONFIG_KEYBOARD_XTKBD)		+= xtkbd.o
++obj-$(CONFIG_KEYBOARD_TDECK)	+= tdeck-keyboard.o
+diff --git a/drivers/input/keyboard/tdeck-keyboard.c b/drivers/input/keyboard/tdeck-keyboard.c
+new file mode 100644
+index 000000000..d13b1feb3
+--- /dev/null
++++ b/drivers/input/keyboard/tdeck-keyboard.c
+@@ -0,0 +1,254 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * LilyGO T-Deck keyboard MCU (I2C address 0x55).
++ *
++ * The keyboard's ESP32-C3 returns one ASCII character for each key press.
++ * Polling follows LilyGO's Keyboard_T_Deck_Master example; returned ASCII is
++ * translated to ordinary Linux EV_KEY press/release pairs.
++ */
++
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/property.h>
++#include <linux/slab.h>
++#include <linux/workqueue.h>
++
++#define TDECK_KBD_DEFAULT_POLL_MS	10
++#define TDECK_KBD_MIN_POLL_MS		5
++#define TDECK_KBD_MAX_POLL_MS		100
++
++struct tdeck_key {
++	unsigned short code;
++	bool shift;
++	bool ctrl;
++};
++
++struct tdeck_keyboard {
++	struct i2c_client *client;
++	struct input_dev *input;
++	struct delayed_work poll_work;
++	unsigned int poll_interval_ms;
++};
++
++static const unsigned short tdeck_letter_keys[] = {
++	KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I,
++	KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R,
++	KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
++};
++
++static const unsigned short tdeck_supported_keys[] = {
++	KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I,
++	KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R,
++	KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
++	KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8,
++	KEY_9, KEY_SPACE, KEY_ENTER, KEY_BACKSPACE, KEY_TAB, KEY_ESC,
++	KEY_GRAVE, KEY_MINUS, KEY_EQUAL, KEY_LEFTBRACE, KEY_RIGHTBRACE,
++	KEY_BACKSLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_COMMA, KEY_DOT,
++	KEY_SLASH, KEY_LEFTSHIFT, KEY_LEFTCTRL,
++};
++
++static bool tdeck_ascii_to_key(u8 ch, struct tdeck_key *key)
++{
++	key->code = KEY_RESERVED;
++	key->shift = false;
++	key->ctrl = false;
++
++	if (ch >= 'a' && ch <= 'z') {
++		key->code = tdeck_letter_keys[ch - 'a'];
++		return true;
++	}
++
++	if (ch >= 'A' && ch <= 'Z') {
++		key->code = tdeck_letter_keys[ch - 'A'];
++		key->shift = true;
++		return true;
++	}
++
++	if (ch >= '1' && ch <= '9') {
++		key->code = KEY_1 + ch - '1';
++		return true;
++	}
++
++	switch (ch) {
++	case '0': key->code = KEY_0; break;
++	case ' ': key->code = KEY_SPACE; break;
++	case '\t': key->code = KEY_TAB; break;
++	case '\r':
++	case '\n': key->code = KEY_ENTER; break;
++	case '\b':
++	case 0x7f: key->code = KEY_BACKSPACE; break;
++	case 0x1b: key->code = KEY_ESC; break;
++	case '`': key->code = KEY_GRAVE; break;
++	case '~': key->code = KEY_GRAVE; key->shift = true; break;
++	case '-': key->code = KEY_MINUS; break;
++	case '_': key->code = KEY_MINUS; key->shift = true; break;
++	case '=': key->code = KEY_EQUAL; break;
++	case '+': key->code = KEY_EQUAL; key->shift = true; break;
++	case '[': key->code = KEY_LEFTBRACE; break;
++	case '{': key->code = KEY_LEFTBRACE; key->shift = true; break;
++	case ']': key->code = KEY_RIGHTBRACE; break;
++	case '}': key->code = KEY_RIGHTBRACE; key->shift = true; break;
++	case '\\': key->code = KEY_BACKSLASH; break;
++	case '|': key->code = KEY_BACKSLASH; key->shift = true; break;
++	case ';': key->code = KEY_SEMICOLON; break;
++	case ':': key->code = KEY_SEMICOLON; key->shift = true; break;
++	case '\'': key->code = KEY_APOSTROPHE; break;
++	case '"': key->code = KEY_APOSTROPHE; key->shift = true; break;
++	case ',': key->code = KEY_COMMA; break;
++	case '<': key->code = KEY_COMMA; key->shift = true; break;
++	case '.': key->code = KEY_DOT; break;
++	case '>': key->code = KEY_DOT; key->shift = true; break;
++	case '/': key->code = KEY_SLASH; break;
++	case '?': key->code = KEY_SLASH; key->shift = true; break;
++	case '!': key->code = KEY_1; key->shift = true; break;
++	case '@': key->code = KEY_2; key->shift = true; break;
++	case '#': key->code = KEY_3; key->shift = true; break;
++	case '$': key->code = KEY_4; key->shift = true; break;
++	case '%': key->code = KEY_5; key->shift = true; break;
++	case '^': key->code = KEY_6; key->shift = true; break;
++	case '&': key->code = KEY_7; key->shift = true; break;
++	case '*': key->code = KEY_8; key->shift = true; break;
++	case '(': key->code = KEY_9; key->shift = true; break;
++	case ')': key->code = KEY_0; key->shift = true; break;
++	default:
++		/* The C3 firmware uses ASCII control characters for Ctrl+A..Z. */
++		if (ch >= 1 && ch <= 26) {
++			key->code = tdeck_letter_keys[ch - 1];
++			key->ctrl = true;
++			break;
++		}
++		return false;
++	}
++
++	return true;
++}
++
++static void tdeck_report_key(struct tdeck_keyboard *kbd,
++			     const struct tdeck_key *key)
++{
++	if (key->shift)
++		input_report_key(kbd->input, KEY_LEFTSHIFT, 1);
++	if (key->ctrl)
++		input_report_key(kbd->input, KEY_LEFTCTRL, 1);
++
++	input_report_key(kbd->input, key->code, 1);
++	input_sync(kbd->input);
++
++	input_report_key(kbd->input, key->code, 0);
++	if (key->ctrl)
++		input_report_key(kbd->input, KEY_LEFTCTRL, 0);
++	if (key->shift)
++		input_report_key(kbd->input, KEY_LEFTSHIFT, 0);
++	input_sync(kbd->input);
++}
++
++static void tdeck_keyboard_poll(struct work_struct *work)
++{
++	struct tdeck_keyboard *kbd =
++		container_of(to_delayed_work(work), struct tdeck_keyboard,
++			     poll_work);
++	struct tdeck_key key;
++	u8 value;
++	int ret;
++
++	ret = i2c_master_recv(kbd->client, &value, sizeof(value));
++	if (ret == 1 && value &&
++	    tdeck_ascii_to_key(value, &key))
++		tdeck_report_key(kbd, &key);
++	else if (ret < 0)
++		dev_dbg_ratelimited(&kbd->client->dev,
++				    "keyboard I2C read failed: %d\n", ret);
++
++	schedule_delayed_work(&kbd->poll_work,
++			      msecs_to_jiffies(kbd->poll_interval_ms));
++}
++
++static int tdeck_keyboard_probe(struct i2c_client *client)
++{
++	struct tdeck_keyboard *kbd;
++	unsigned int i;
++	u32 poll_interval_ms = TDECK_KBD_DEFAULT_POLL_MS;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return dev_err_probe(&client->dev, -EOPNOTSUPP,
++				     "adapter does not support raw I2C\n");
++
++	device_property_read_u32(&client->dev, "poll-interval-ms",
++			 &poll_interval_ms);
++	if (poll_interval_ms < TDECK_KBD_MIN_POLL_MS ||
++	    poll_interval_ms > TDECK_KBD_MAX_POLL_MS)
++		return dev_err_probe(&client->dev, -EINVAL,
++				     "poll-interval-ms must be between %u and %u\n",
++				     TDECK_KBD_MIN_POLL_MS,
++				     TDECK_KBD_MAX_POLL_MS);
++
++	kbd = devm_kzalloc(&client->dev, sizeof(*kbd), GFP_KERNEL);
++	if (!kbd)
++		return -ENOMEM;
++
++	kbd->client = client;
++	kbd->poll_interval_ms = poll_interval_ms;
++	kbd->input = devm_input_allocate_device(&client->dev);
++	if (!kbd->input)
++		return -ENOMEM;
++
++	kbd->input->name = "LilyGO T-Deck I2C Keyboard";
++	kbd->input->phys = "i2c/tdeck-keyboard";
++	kbd->input->id.bustype = BUS_I2C;
++	kbd->input->dev.parent = &client->dev;
++	for (i = 0; i < ARRAY_SIZE(tdeck_supported_keys); i++)
++		input_set_capability(kbd->input, EV_KEY,
++				     tdeck_supported_keys[i]);
++
++	i2c_set_clientdata(client, kbd);
++	INIT_DELAYED_WORK(&kbd->poll_work, tdeck_keyboard_poll);
++	ret = input_register_device(kbd->input);
++	if (ret)
++		return ret;
++
++	schedule_delayed_work(&kbd->poll_work,
++			      msecs_to_jiffies(kbd->poll_interval_ms));
++	dev_info(&client->dev, "keyboard polling every %u ms\n",
++		 kbd->poll_interval_ms);
++
++	return 0;
++}
++
++static void tdeck_keyboard_remove(struct i2c_client *client)
++{
++	struct tdeck_keyboard *kbd = i2c_get_clientdata(client);
++
++	cancel_delayed_work_sync(&kbd->poll_work);
++}
++
++static const struct of_device_id tdeck_keyboard_of_match[] = {
++	{ .compatible = "lilygo,t-deck-keyboard" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, tdeck_keyboard_of_match);
++
++static const struct i2c_device_id tdeck_keyboard_id[] = {
++	{ "tdeck-keyboard", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, tdeck_keyboard_id);
++
++static struct i2c_driver tdeck_keyboard_driver = {
++	.driver = {
++		.name = "tdeck-keyboard",
++		.of_match_table = tdeck_keyboard_of_match,
++	},
++	.probe = tdeck_keyboard_probe,
++	.remove = tdeck_keyboard_remove,
++	.id_table = tdeck_keyboard_id,
++};
++module_i2c_driver(tdeck_keyboard_driver);
++
++MODULE_DESCRIPTION("LilyGO T-Deck I2C keyboard driver");
++MODULE_AUTHOR("OpenAI");
++MODULE_LICENSE("GPL");
+-- 
+2.43.0
+

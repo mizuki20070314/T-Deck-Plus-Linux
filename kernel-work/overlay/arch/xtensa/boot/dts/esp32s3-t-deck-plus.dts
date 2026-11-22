@@ -1,0 +1,448 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * LilyGO T-Deck Plus: ESP32-S3FN16R8, 16 MiB flash, 8 MiB PSRAM.
+ *
+ * Board pin assignments are from LilyGO's T-Deck Plus documentation and the
+ * Zephyr t_deck board description. The ST7789 is write-only on SPI2; GPIO10
+ * powers the board peripherals, and GPIO42 is the LCD backlight.
+ */
+/dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/input/input.h>
+#include "gpio-esp32.h"
+#include "esp32s3.dtsi"
+
+/* GPIO matrix signal numbers, ESP32-S3 TRM table 6-2. */
+#define SIG_FSPICLK	101
+#define SIG_FSPID	103
+#define SIG_FSPICS0	110
+
+/* ESP32-S3 GPIO-matrix output signal indices. */
+#define SIG_I2S1_MCLK	21
+#define SIG_I2S0_BCK	22
+#define SIG_I2S0_WS	24
+#define SIG_I2S0_SD	25
+#define SIG_I2S1_BCK	28
+#define SIG_I2S1_WS	29
+#define SIG_I2S1_SD	30
+#define SIG_GPIO_IN_MUX	0x80
+
+/ {
+	model = "LilyGO T-Deck Plus";
+
+	chosen {
+		/* UART0 is wired to the GPS (GPIO43/44), not the serial console.
+		 * Use the ESP32-S3 USB Serial/JTAG ACM port instead. */
+		bootargs = "console=tty0 console=ttyGS3 fbcon=font:VGA8x16 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay ";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x3d800000 0x00800000>;
+	};
+
+	/* The touchscreen's rails are always present while GPIO10 enables the
+	 * peripheral domain. These fixed regulators describe the board wiring;
+	 * they do not switch the rails. */
+	touch_avdd28: avdd28-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "tdeck-touch-avdd28";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		regulator-always-on;
+	};
+
+	touch_vddio: vddio-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "tdeck-touch-vddio";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	/* The keyboard is an I2C slave MCU, not a matrix wired to the S3. */
+	i2c0 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		compatible = "i2c-gpio";
+		sda-gpios = <&gpio0 18 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&gpio0 8 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		status = "okay";
+
+		keyboard@55 {
+			compatible = "lilygo,t-deck-keyboard";
+			reg = <0x55>;
+			poll-interval-ms = <10>;
+			status = "okay";
+		};
+
+			touchscreen@5d {
+			compatible = "goodix,gt911";
+			reg = <0x5d>;
+			interrupt-parent = <&gpio0>;
+			interrupts = <16 IRQ_TYPE_EDGE_FALLING>;
+			irq-gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;
+			AVDD28-supply = <&touch_avdd28>;
+			VDDIO-supply = <&touch_vddio>;
+			touchscreen-size-x = <240>;
+			touchscreen-size-y = <320>;
+			touchscreen-swapped-x-y;
+			touchscreen-inverted-x;
+			status = "okay";
+		};
+
+		es7210: audio-codec@40 {
+			compatible = "everest,es7210";
+			reg = <0x40>;
+			#sound-dai-cells = <0>;
+			status = "okay";
+		};
+	};
+
+	trackball: trackball {
+		compatible = "gpio-keys";
+		status = "okay";
+
+		trackball-press {
+			label = "Trackball Press";
+			linux,code = <KEY_ENTER>;
+			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+			debounce-interval = <5>;
+		};
+
+		trackball-up {
+			label = "Trackball Up";
+			linux,code = <KEY_UP>;
+			gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
+			debounce-interval = <2>;
+		};
+
+		trackball-down {
+			label = "Trackball Down";
+			linux,code = <KEY_DOWN>;
+			gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
+			debounce-interval = <2>;
+		};
+
+		trackball-left {
+			label = "Trackball Left";
+			linux,code = <KEY_LEFT>;
+			gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
+			debounce-interval = <2>;
+		};
+
+		trackball-right {
+			label = "Trackball Right";
+			linux,code = <KEY_RIGHT>;
+			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
+			debounce-interval = <2>;
+		};
+	};
+
+	/* The GDMA block is shared by I2S0/I2S1. The audio driver accesses it
+	 * through this shared syscon regmap and reserves only its own channels. */
+	gdma_syscon: syscon@6003f000 {
+		compatible = "syscon";
+		reg = <0x6003f000 0x410>;
+	};
+
+	/* I2S0 drives the MAX98357A; I2S1 clocks the ES7210's 4-slot TDM stream. */
+	i2s0_clk: i2s0-clock {
+		#clock-cells = <0>;
+		compatible = "gpio-gate-clock";
+		clocks = <&clk 2>;
+		enable-gpios = <&clk_gpio0 4 0>;
+	};
+
+	i2s1_clk: i2s1-clock {
+		#clock-cells = <0>;
+		compatible = "gpio-gate-clock";
+		clocks = <&clk 2>;
+		enable-gpios = <&clk_gpio0 21 0>;
+	};
+
+	gdma_clk: gdma-clock {
+		#clock-cells = <0>;
+		compatible = "gpio-gate-clock";
+		clocks = <&clk 2>;
+		enable-gpios = <&clk_gpio1 6 0>;
+	};
+
+	i2s0: i2s@6000f000 {
+		compatible = "espressif,esp32s3-i2s";
+		reg = <0x6000f000 0x1000>;
+		reg-names = "i2s";
+		interrupt-parent = <&intc>;
+		interrupts = <71 13 0>; /* GDMA TX channel 0, CPU0 external IRQ13 */
+		clocks = <&i2s0_clk>, <&gdma_clk>;
+		clock-names = "i2s", "gdma";
+		resets = <&reset 4>;
+		reset-names = "reset";
+		espressif,gdma-syscon = <&gdma_syscon>;
+		#sound-dai-cells = <0>;
+		pinctrl-0 = <&tdeck_audio_i2s0_pins>, <&tdeck_audio_i2s0_out>;
+		pinctrl-names = "default";
+		status = "okay";
+	};
+
+	i2s1: i2s@6002d000 {
+		compatible = "espressif,esp32s3-i2s";
+		reg = <0x6002d000 0x1000>;
+		reg-names = "i2s";
+		interrupt-parent = <&intc>;
+		interrupts = <67 17 0>; /* GDMA RX channel 1, CPU0 external IRQ17 */
+		clocks = <&i2s1_clk>, <&gdma_clk>;
+		clock-names = "i2s", "gdma";
+		resets = <&reset 21>;
+		reset-names = "reset";
+		espressif,gdma-syscon = <&gdma_syscon>;
+		espressif,rx-tdm-slots = <4>;
+		#sound-dai-cells = <0>;
+		pinctrl-0 = <&tdeck_audio_i2s1_pins>,
+			    <&tdeck_audio_i2s1_out>, <&tdeck_audio_i2s1_in>;
+		pinctrl-names = "default";
+		status = "okay";
+	};
+
+	max98357a: speaker-amplifier {
+		compatible = "maxim,max98357a";
+		#sound-dai-cells = <0>;
+		status = "okay";
+	};
+
+	sound-speaker {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "T-Deck Plus Speaker";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,bitclock-master = <&speaker_cpu>;
+		simple-audio-card,frame-master = <&speaker_cpu>;
+		simple-audio-card,widgets = "Speaker", "Internal Speaker";
+		simple-audio-card,routing = "Internal Speaker", "Speaker";
+
+		speaker_cpu: simple-audio-card,cpu {
+			sound-dai = <&i2s0>;
+			system-clock-direction-out;
+		};
+		simple-audio-card,codec {
+			sound-dai = <&max98357a>;
+		};
+	};
+
+	sound-microphone {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "T-Deck Plus Microphone";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,bitclock-master = <&microphone_cpu>;
+		simple-audio-card,frame-master = <&microphone_cpu>;
+		simple-audio-card,widgets = "Microphone", "T-Deck MIC1",
+					"Microphone", "T-Deck MIC3";
+		simple-audio-card,routing = "MIC1", "T-Deck MIC1",
+					 "MIC3", "T-Deck MIC3";
+
+		microphone_cpu: simple-audio-card,cpu {
+			sound-dai = <&i2s1>;
+			system-clock-direction-out;
+		};
+		simple-audio-card,codec {
+			sound-dai = <&es7210>;
+		};
+	};
+};
+
+&iomux {
+	status = "okay";
+
+	/* Configure GPIOs before gpio-hogs turn on the shared peripheral rail
+	 * and set the inactive CS/backlight levels. */
+	tdeck_gpio_pins: tdeck_gpio_pins {
+		pinctrl-single,pins = <
+			PIN(0)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball press / BOOT */
+			PIN(1)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball left */
+			PIN(2)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball right */
+			PIN(3)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball up */
+			PIN(8)  (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* I2C SCL */
+			PIN(9)  (FUN_SEL(1) | FUN_DRV_20MA)                  /* LoRa CS, inactive */
+			PIN(10) (FUN_SEL(1) | FUN_DRV_20MA)                  /* peripheral power */
+			PIN(11) (FUN_SEL(1) | FUN_DRV_20MA)                  /* TFT D/C */
+			PIN(15) (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* trackball down */
+			PIN(16) (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* GT911 IRQ */
+			PIN(18) (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU) /* I2C SDA */
+			PIN(39) (FUN_SEL(1) | FUN_DRV_20MA)                  /* SD CS, inactive */
+			PIN(42) (FUN_SEL(1) | FUN_DRV_20MA)                  /* TFT backlight */
+			PIN(46) (FUN_SEL(1) | FUN_IE | FUN_WPU)>;             /* keyboard IRQ (polled protocol) */
+	};
+
+	tdeck_spi2_pins: tdeck_spi2_pins {
+		pinctrl-single,pins = <
+			PIN(12) (FUN_SEL(1) | FUN_DRV_20MA) /* TFT CS */
+			PIN(40) (FUN_SEL(1) | FUN_DRV_40MA) /* SPI SCK */
+			PIN(41) (FUN_SEL(1) | FUN_DRV_40MA)>;/* SPI MOSI */
+	};
+
+	tdeck_audio_i2s0_pins: tdeck_audio_i2s0_pins {
+		pinctrl-single,pins = <
+			PIN(5)  (FUN_SEL(1) | FUN_DRV_20MA) /* I2S0 WS */
+			PIN(6)  (FUN_SEL(1) | FUN_DRV_20MA) /* I2S0 SD */
+			PIN(7)  (FUN_SEL(1) | FUN_DRV_20MA)>; /* I2S0 BCK */
+	};
+
+	tdeck_audio_i2s1_pins: tdeck_audio_i2s1_pins {
+		pinctrl-single,pins = <
+			PIN(14) (FUN_SEL(1) | FUN_IE) /* ES7210 SDOUT1 */
+			PIN(21) (FUN_SEL(1) | FUN_DRV_20MA) /* I2S1 WS */
+			PIN(47) (FUN_SEL(1) | FUN_DRV_20MA) /* I2S1 BCK */
+			PIN(48) (FUN_SEL(1) | FUN_DRV_20MA)>; /* ES7210 MCLK */
+	};
+
+	tdeck_uart0_pins: tdeck_uart0_pins {
+		pinctrl-single,pins = <
+			PIN(43) FUN0_20MA         /* GPS TX */
+			PIN(44) FUN0_20MA_IE_WPU>; /* GPS RX */
+	};
+};
+
+&gpio_out_mux {
+	status = "okay";
+
+	tdeck_spi2_out: tdeck_spi2_out {
+		pinctrl-single,pins = <
+			GPIO_FUNC_OUT_SEL(12) SIG_FSPICS0
+			GPIO_FUNC_OUT_SEL(40) SIG_FSPICLK
+			GPIO_FUNC_OUT_SEL(41) SIG_FSPID>;
+	};
+
+	tdeck_audio_i2s0_out: tdeck_audio_i2s0_out {
+		pinctrl-single,pins = <
+			GPIO_FUNC_OUT_SEL(7) SIG_I2S0_BCK
+			GPIO_FUNC_OUT_SEL(5) SIG_I2S0_WS
+			GPIO_FUNC_OUT_SEL(6) SIG_I2S0_SD>;
+	};
+
+	tdeck_audio_i2s1_out: tdeck_audio_i2s1_out {
+		pinctrl-single,pins = <
+			GPIO_FUNC_OUT_SEL(47) SIG_I2S1_BCK
+			GPIO_FUNC_OUT_SEL(21) SIG_I2S1_WS
+			GPIO_FUNC_OUT_SEL(48) SIG_I2S1_MCLK>;
+	};
+};
+
+&gpio_in_mux {
+	status = "okay";
+
+	tdeck_audio_i2s1_in: tdeck_audio_i2s1_in {
+		pinctrl-single,pins = <
+			GPIO_FUNC_IN_SEL(SIG_I2S1_SD) (14 | SIG_GPIO_IN_MUX)>;
+	};
+};
+
+&gpio0 {
+	pinctrl-0 = <&tdeck_gpio_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	peripheral-power {
+		gpio-hog;
+		gpios = <10 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "peripheral-power";
+	};
+
+	lora-cs-inactive {
+		gpio-hog;
+		gpios = <9 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "lora-cs-inactive";
+	};
+
+	sd-cs-inactive {
+		gpio-hog;
+		gpios = <39 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "sd-cs-inactive";
+	};
+
+	display-backlight {
+		gpio-hog;
+		gpios = <42 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "display-backlight";
+	};
+};
+
+&uart0 {
+	pinctrl-0 = <&tdeck_uart0_pins>;
+	pinctrl-names = "default";
+	current-speed = <9600>;
+	status = "okay";
+};
+
+&spi2 {
+	pinctrl-0 = <&tdeck_spi2_pins>, <&tdeck_spi2_out>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	display@0 {
+		compatible = "sitronix,st7789v";
+		reg = <0>;
+		spi-max-frequency = <40000000>;
+		buswidth = <8>;
+		/* FBTFT's native geometry is portrait; MADCTL rotates it to the
+		 * T-Deck's 320x240 landscape orientation. */
+		width = <240>;
+		height = <320>;
+		rotate = <270>;
+		dc-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+		gamma = "D0 0D 14 0D 0D 09 38 44 4E 3A 17 18 2F 30\nD0 09 0F 08 07 14 37 44 4D 38 15 16 2C 3E";
+
+		/* ST7789V initialization for the T-Deck's 320x240 panel, based on
+		 * the Zephyr/LilyGO sequence. FBTFT interprets bit 24 as a
+		 * register write and bit 25 as a millisecond delay. */
+		init = <
+			0x01000001             /* software reset */
+			0x02000005             /* 5 ms */
+			0x01000028             /* display off */
+			0x010000DF 0x5A 0x69 0x02 0x01 /* command-2 enable */
+			0x010000B2 0x0C 0x0C 0x00 0x33 0x33 /* porch */
+			0x010000BA 0x00       /* digital gamma disabled */
+			0x010000C6 0x0F       /* frame rate */
+			0x010000B7 0x75       /* gate control */
+			0x010000BB 0x1A       /* VCOM */
+			0x010000C2 0x01       /* VDV/VRH enable */
+			0x010000C3 0x13       /* VRH */
+			0x010000C4 0x20       /* VDV */
+			0x010000D0 0xA4 0xA1 /* power control */
+			0x0100003A 0x55       /* RGB565 */
+			0x010000C0 0x2C       /* LCM control */
+			0x01000026 0x01       /* gamma curve */
+			0x01000021             /* inversion on */
+			0x010000E0 0xD0 0x0D 0x14 0x0D 0x0D 0x09 0x38
+			           0x44 0x4E 0x3A 0x17 0x18 0x2F 0x30
+			0x010000E1 0xD0 0x09 0x0F 0x08 0x07 0x14 0x37
+			           0x44 0x4D 0x38 0x15 0x16 0x2C 0x3E
+			0x010000B0 0x00 0xF0 /* RAM control */
+			0x010000B1 0x40 0x02 0x14 /* RGB control */
+			0x01000011             /* sleep out */
+			0x02000078             /* 120 ms */
+			0x01000029             /* display on */
+			0x0200000A             /* 10 ms */
+		>;
+	};
+};
+
+&acm {
+	status = "okay";
+};
+
+&ipc {
+	wifi@1 {
+		compatible = "esp,esp32-wifi-shmem";
+		reg = <1>;
+	};
+};
+
+&intc {
+	reg = <0x600c2800 0x800>;
+};

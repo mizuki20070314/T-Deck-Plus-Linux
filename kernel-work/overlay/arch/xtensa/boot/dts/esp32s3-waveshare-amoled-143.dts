@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Waveshare ESP32-S3-Touch-AMOLED-1.43: ESP32-S3R8, 16 MB flash, 8 MB PSRAM,
+ * 1.43" 466x466 AMOLED (CO5300 or SH8601) on a Quad-SPI bus.
+ *
+ * Same system as esp32s3-devkit-c1.dts, plus the display on SPI2. The panel's
+ * pins are not the ones SPI2 has in the IO MUX (CS0 10, CLK 12, D 11, Q 13,
+ * WP 14, HD 9), so every line is routed through the GPIO matrix instead:
+ *
+ *	GPIO9  CS	FSPICS0
+ *	GPIO10 CLK	FSPICLK
+ *	GPIO11 D0	FSPID
+ *	GPIO12 D1	FSPIQ
+ *	GPIO13 D2	FSPIWP
+ *	GPIO14 D3	FSPIHD
+ *	GPIO21 panel reset (active low)
+ *	GPIO42 panel power enable
+ */
+/dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include "gpio-esp32.h"
+#include "esp32s3.dtsi"
+
+/* GPIO matrix signal numbers, ESP32-S3 TRM table 6-2 (soc/gpio_sig_map.h) */
+#define SIG_FSPICLK	101
+#define SIG_FSPIQ	102
+#define SIG_FSPID	103
+#define SIG_FSPIHD	104
+#define SIG_FSPIWP	105
+#define SIG_FSPICS0	110
+
+/ {
+	model = "Waveshare ESP32-S3-Touch-AMOLED-1.43";
+
+	/* tty0 first: the kernel log also goes to the display. /dev/console
+	 * stays on the last console= entry, ttyS0, as before. fbcon would pick the
+	 * 8x8 font for a framebuffer shorter than 400 rows, so ask for the 8x16 one. */
+	chosen {
+		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=tty0 console=ttyGS3 console=ttyS0,115200n8 quiet fbcon=font:VGA8x16 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay ";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x3d800000 0x00800000>;
+	};
+
+	i2c0 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		compatible = "i2c-gpio";
+
+		sda-gpios = <&gpio0 6 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&gpio0 7 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+
+		pinctrl-0 = <&i2c0_pins>;
+		pinctrl-names = "default";
+	};
+};
+
+&iomux {
+	status = "ok";
+
+	i2c0_pins: i2c0_pins {
+		pinctrl-single,pins = <
+			PIN(6) FUN0_20MA_IE_WPU			/* SDA */
+			PIN(7) FUN0_20MA_IE_WPU>;		/* SCL */
+	};
+	/* IO MUX function 1 is plain GPIO: the pads follow the GPIO matrix. */
+	spi2_pins: spi2_pins {
+		pinctrl-single,pins = <
+			PIN(9)  (FUN_SEL(1) | FUN_DRV_20MA)	/* CS */
+			PIN(10) (FUN_SEL(1) | FUN_DRV_40MA)	/* CLK */
+			PIN(11) (FUN_SEL(1) | FUN_DRV_40MA)	/* D0 */
+			PIN(12) (FUN_SEL(1) | FUN_DRV_40MA)	/* D1 */
+			PIN(13) (FUN_SEL(1) | FUN_DRV_40MA)	/* D2 */
+			PIN(14) (FUN_SEL(1) | FUN_DRV_40MA)>;	/* D3 */
+	};
+	/*
+	 * Plain GPIOs of the panel. The gpio driver does not touch the IO MUX,
+	 * and GPIO42 comes out of reset as the JTAG pin MTMS, so say it here.
+	 */
+	panel_pins: panel_pins {
+		pinctrl-single,pins = <
+			PIN(21) (FUN_SEL(1) | FUN_DRV_20MA)	/* reset */
+			PIN(42) (FUN_SEL(1) | FUN_DRV_20MA)>;	/* power enable */
+	};
+	uart0_pins: uart0_pins {
+		pinctrl-single,pins = <
+			PIN(43) FUN0_20MA			/* U0TXD */
+			PIN(44) FUN0_20MA_IE_WPU>;		/* U0RXD */
+	};
+};
+
+/* Output side of the matrix: which peripheral signal drives which pad. The
+ * output enable stays with the peripheral (OEN_SEL = 0). */
+&gpio_out_mux {
+	status = "ok";
+
+	spi2_out: spi2_out {
+		pinctrl-single,pins = <
+			GPIO_FUNC_OUT_SEL(9)  SIG_FSPICS0
+			GPIO_FUNC_OUT_SEL(10) SIG_FSPICLK
+			GPIO_FUNC_OUT_SEL(11) SIG_FSPID
+			GPIO_FUNC_OUT_SEL(12) SIG_FSPIQ
+			GPIO_FUNC_OUT_SEL(13) SIG_FSPIWP
+			GPIO_FUNC_OUT_SEL(14) SIG_FSPIHD>;
+	};
+};
+
+&gpio0 {
+	status = "ok";
+};
+
+&uart0 {
+	pinctrl-0 = <&uart0_pins>;
+	pinctrl-names = "default";
+	status = "ok";
+};
+
+&spi2 {
+	pinctrl-0 = <&spi2_pins>, <&spi2_out>;
+	pinctrl-names = "default";
+	status = "ok";
+
+	/* Use waveshare,amoled-1.43-sh8601 on units whose panel ID reads 0x86. */
+	display@0 {
+		compatible = "waveshare,amoled-1.43-co5300";
+		reg = <0>;
+		spi-max-frequency = <40000000>;
+		spi-tx-bus-width = <4>;
+		pinctrl-0 = <&panel_pins>;
+		pinctrl-names = "default";
+		reset-gpios = <&gpio0 21 GPIO_ACTIVE_LOW>;
+		enable-gpios = <&gpio0 42 GPIO_ACTIVE_HIGH>;
+
+		/*
+		 * The glass is round, so a console in the corners of the 466x466 square
+		 * would be cut off. Use the biggest 8x16-font console that fits inside the
+		 * circle (41x20 characters, corner distance 229 px < radius 233 px), centred.
+		 * x-offset is the panel column of the first pixel: 68 visible columns in,
+		 * plus the 6 columns the CO5300 keeps hidden. y-offset is 72 rows in.
+		 * For the whole square use width = height = 466, x-offset = 6, y-offset = 0.
+		 */
+		width = <328>;
+		height = <320>;
+		x-offset = <74>;
+		y-offset = <72>;
+	};
+};
+
+&acm {
+	status = "ok";
+};
+
+&ipc {
+	wifi@1 {
+		compatible = "esp,esp32-wifi-shmem";
+		reg = <1>;
+	};
+};
+
+&intc {
+	reg = <0x600c2800 0x800>;
+};

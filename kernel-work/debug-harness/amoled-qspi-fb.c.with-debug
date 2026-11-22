@@ -1,0 +1,1471 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Framebuffer driver for AMOLED panels with a Quad-SPI interface and an
+ * SH8601 or CO5300 controller, such as the 466x466 panel of the Waveshare
+ * ESP32-S3-Touch-AMOLED-1.43.
+ *
+ * Bus protocol (SH8601Z datasheet, "Quad SPI Interface"; chip select stays
+ * low for a whole frame):
+ *
+ *   register write   02h, 00h, <cmd>, 00h, <parameters>            (1 line)
+ *   pixel write      32h, 00h, 2Ch (first) / 3Ch (continue), 00h,
+ *                    <RGB565, high byte first>                      (header on
+ *                                                  1 line, pixels on 4 lines)
+ *
+ * With "pixel-wires = 1" the pixels use the 02h opcode and a single line, a
+ * slow path that is handy when bringing up new wiring.
+ *
+ * The framebuffer lives in RAM; drawing marks the touched rectangle dirty and a
+ * delayed work sends that rectangle to the panel. The controller wants write
+ * windows that start on even and end on odd coordinates, so rectangles are
+ * widened to that grid first.
+ */
+
+#include <linux/ctype.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/fb.h>
+#include <linux/gfp.h>
+#include <linux/gpio/consumer.h>
+#include <linux/io.h>
+#include <linux/kernel.h>
+#include <linux/ktime.h>
+#include <linux/mm.h>
+#include <linux/mod_devicetable.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/property.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/spi/spi.h>
+#include <linux/spinlock.h>
+#include <linux/swab.h>
+#include <linux/workqueue.h>
+
+#define AMOLED_OP_WRITE_REG	0x02
+#define AMOLED_OP_WRITE_PIX4	0x32
+
+#define AMOLED_CMD_SLPIN	0x10
+#define AMOLED_CMD_SLPOUT	0x11
+#define AMOLED_CMD_DISPOFF	0x28
+#define AMOLED_CMD_DISPON	0x29
+#define AMOLED_CMD_CASET	0x2a
+#define AMOLED_CMD_RASET	0x2b
+#define AMOLED_CMD_RAMWR	0x2c
+#define AMOLED_CMD_MADCTL	0x36
+#define AMOLED_CMD_COLMOD	0x3a
+#define AMOLED_CMD_RAMWRC	0x3c
+#define AMOLED_CMD_WRDISBV	0x51
+
+#define AMOLED_TXBUF_SIZE	4096
+#define AMOLED_MAX_PARAMS	4
+
+/*
+ * Bring-up helpers for the ESP32-S3: dump the pad and SPI registers, and drive
+ * the panel by bit-banging the same pins (the way the vendor demo reads the
+ * panel ID) to tell a pin or power problem from a problem of the SPI engine.
+ * Not for upstream.
+ */
+#define AMOLED_ESP32_DEBUG	1
+
+static unsigned int flush_delay_ms = 20;
+module_param(flush_delay_ms, uint, 0644);
+MODULE_PARM_DESC(flush_delay_ms, "Wait this long after drawing before updating the panel");
+
+/* writable at run time through /sys/module/amoled_qspi_fb/parameters */
+static unsigned int pixel_wires;
+module_param(pixel_wires, uint, 0644);
+MODULE_PARM_DESC(pixel_wires, "Force 1 or 4 pixel lines (0: as the devicetree says)");
+
+struct amoled_cmd {
+	u8 cmd;
+	u8 len;
+	u8 data[AMOLED_MAX_PARAMS];
+	u16 delay_ms;
+};
+
+struct amoled_variant {
+	const char *name;
+	const struct amoled_cmd *pre;	/* before the first pixels reach the panel */
+	unsigned int n_pre;
+	const struct amoled_cmd *post;	/* display on, brightness */
+	unsigned int n_post;
+	u16 x_offset;			/* panel columns left of the first pixel */
+};
+
+/* From the vendor demo (Waveshare ESP32-S3-AMOLED-1.43-Demo, example_qspi_with_ram.c) */
+static const struct amoled_cmd co5300_pre[] = {
+	{ AMOLED_CMD_SLPOUT, 0, { 0 }, 80 },
+	{ 0xc4, 1, { 0x80 }, 0 },		/* SPI_MODE: Quad-SPI */
+	{ 0x53, 1, { 0x20 }, 1 },		/* WRCTRLD: brightness control on */
+	{ 0x63, 1, { 0xff }, 1 },		/* HBM brightness */
+	{ AMOLED_CMD_WRDISBV, 1, { 0x00 }, 1 },
+};
+static const struct amoled_cmd co5300_post[] = {
+	{ AMOLED_CMD_DISPON, 0, { 0 }, 10 },
+};
+static const struct amoled_variant co5300_variant = {
+	.name = "CO5300",
+	.pre = co5300_pre,	.n_pre = ARRAY_SIZE(co5300_pre),
+	.post = co5300_post,	.n_post = ARRAY_SIZE(co5300_post),
+	.x_offset = 6,
+};
+
+static const struct amoled_cmd sh8601_pre[] = {
+	{ AMOLED_CMD_SLPOUT, 0, { 0 }, 120 },
+	{ 0x44, 2, { 0x01, 0xd1 }, 0 },		/* tear scan line */
+	{ 0x35, 1, { 0x00 }, 0 },		/* tearing effect on */
+	{ 0x53, 1, { 0x20 }, 10 },		/* WRCTRLD: brightness control on */
+	{ AMOLED_CMD_WRDISBV, 1, { 0x00 }, 10 },
+};
+static const struct amoled_cmd sh8601_post[] = {
+	{ AMOLED_CMD_DISPON, 0, { 0 }, 10 },
+};
+static const struct amoled_variant sh8601_variant = {
+	.name = "SH8601",
+	.pre = sh8601_pre,	.n_pre = ARRAY_SIZE(sh8601_pre),
+	.post = sh8601_post,	.n_post = ARRAY_SIZE(sh8601_post),
+	.x_offset = 0,
+};
+
+struct amoled_fb {
+	struct spi_device *spi;
+	struct fb_info *info;
+	const struct amoled_variant *variant;
+	struct gpio_desc *reset;
+	struct gpio_desc *enable;
+
+	u32 width, height;
+	u32 x_offset, y_offset;
+	unsigned int pix_wires;		/* 4 or 1 */
+	u8 brightness;
+	bool display_on;
+
+	struct mutex io_lock;		/* the SPI device, the buffers below */
+	u8 hdr[4];
+	u8 params[AMOLED_MAX_PARAMS];
+	u8 *txbuf;
+
+	struct delayed_work flush_work;
+	spinlock_t dirty_lock;		/* the dirty rectangle */
+	bool dirty;
+	u32 dx1, dy1, dx2, dy2;
+
+	u32 palette[16];
+
+	/* the last panel update, for /sys/.../flush_stats */
+	u32 flushes;
+	u32 last_flush_us;
+	u32 last_flush_px;
+	u32 max_flush_us;	/* of the largest update so far */
+	u32 max_flush_px;
+
+#if AMOLED_ESP32_DEBUG
+	bool bitbang;		/* register writes go out on the pins by hand */
+	void __iomem *dbg_gpio;
+	void __iomem *dbg_iomux;
+	void __iomem *dbg_spi2;
+	u32 dbg_sel[6];		/* GPIO matrix output selects of pins 9..14 */
+#endif
+};
+
+#if AMOLED_ESP32_DEBUG
+#define ES_GPIO_BASE		0x60004000UL
+#define ES_IOMUX_BASE		0x60009000UL	/* IO_MUX_GPIOn_REG is at +4+4n */
+#define ES_SPI2_BASE		0x60024000UL
+
+#define ES_GPIO_OUT		0x04
+#define ES_GPIO_OUT_W1TS	0x08
+#define ES_GPIO_OUT_W1TC	0x0c
+#define ES_GPIO_OUT1		0x10
+#define ES_GPIO_OUT1_W1TS	0x14
+#define ES_GPIO_OUT1_W1TC	0x18
+#define ES_GPIO_ENABLE		0x20
+#define ES_GPIO_ENABLE_W1TS	0x24
+#define ES_GPIO_ENABLE_W1TC	0x28
+#define ES_GPIO_ENABLE1		0x2c
+#define ES_GPIO_ENABLE1_W1TS	0x30
+#define ES_GPIO_ENABLE1_W1TC	0x34
+#define ES_GPIO_IN		0x3c
+#define ES_GPIO_IN1		0x40
+#define ES_GPIO_FUNC_OUT_SEL(n)	(0x554 + 4 * (n))
+#define ES_IOMUX_GPIO(n)	(0x04 + 4 * (n))
+#define ES_FUN_IE		0x200
+
+#define PIN_CS	9
+#define PIN_CLK	10
+#define PIN_D0	11
+
+static const u8 amoled_dbg_pins[] = { 9, 10, 11, 12, 13, 14, 21, 42 };
+
+static void es_pin_set(struct amoled_fb *par, unsigned int pin, bool level)
+{
+	if (pin < 32)
+		writel(BIT(pin), par->dbg_gpio +
+		       (level ? ES_GPIO_OUT_W1TS : ES_GPIO_OUT_W1TC));
+	else
+		writel(BIT(pin - 32), par->dbg_gpio +
+		       (level ? ES_GPIO_OUT1_W1TS : ES_GPIO_OUT1_W1TC));
+}
+
+static void es_pin_oe(struct amoled_fb *par, unsigned int pin, bool on)
+{
+	if (pin < 32)
+		writel(BIT(pin), par->dbg_gpio +
+		       (on ? ES_GPIO_ENABLE_W1TS : ES_GPIO_ENABLE_W1TC));
+	else
+		writel(BIT(pin - 32), par->dbg_gpio +
+		       (on ? ES_GPIO_ENABLE1_W1TS : ES_GPIO_ENABLE1_W1TC));
+}
+
+static int es_pin_in(struct amoled_fb *par, unsigned int pin)
+{
+	if (pin < 32)
+		return (readl(par->dbg_gpio + ES_GPIO_IN) >> pin) & 1;
+	return (readl(par->dbg_gpio + ES_GPIO_IN1) >> (pin - 32)) & 1;
+}
+
+/* Take pins 9..14 away from the SPI engine: plain GPIO outputs. */
+static void amoled_bb_begin(struct amoled_fb *par)
+{
+	unsigned int i;
+
+	for (i = 0; i < 6; i++) {
+		par->dbg_sel[i] = readl(par->dbg_gpio + ES_GPIO_FUNC_OUT_SEL(9 + i));
+		/*
+		 * GPIO_FUNCn_OUT_SEL_CFG: [8:0] signal, 9 invert output,
+		 * 10 output enable from GPIO_ENABLE, 11 invert enable.
+		 * Signal 256 is the GPIO_OUT register.
+		 */
+		writel(256 | BIT(10), par->dbg_gpio + ES_GPIO_FUNC_OUT_SEL(9 + i));
+	}
+	es_pin_set(par, PIN_CS, true);
+	es_pin_set(par, PIN_CLK, false);
+	es_pin_set(par, PIN_D0, false);
+	es_pin_set(par, 12, true);
+	es_pin_set(par, 13, true);
+	es_pin_set(par, 14, true);
+	for (i = 0; i < 6; i++)
+		es_pin_oe(par, 9 + i, true);
+	par->bitbang = true;
+}
+
+static void amoled_bb_end(struct amoled_fb *par)
+{
+	unsigned int i;
+
+	for (i = 0; i < 6; i++) {
+		es_pin_oe(par, 9 + i, false);
+		writel(par->dbg_sel[i], par->dbg_gpio + ES_GPIO_FUNC_OUT_SEL(9 + i));
+	}
+	par->bitbang = false;
+}
+
+/* One frame, one line, mode 0: data set up while CLK is low, latched on the rising edge. */
+static void amoled_bb_send(struct amoled_fb *par, const u8 *b, size_t n)
+{
+	size_t i;
+	int bit;
+
+	es_pin_set(par, PIN_CS, false);
+	udelay(2);
+	for (i = 0; i < n; i++) {
+		for (bit = 7; bit >= 0; bit--) {
+			es_pin_set(par, PIN_D0, (b[i] >> bit) & 1);
+			es_pin_set(par, PIN_CLK, false);
+			udelay(1);
+			es_pin_set(par, PIN_CLK, true);
+			udelay(1);
+		}
+	}
+	es_pin_set(par, PIN_CLK, false);
+	udelay(2);
+	es_pin_set(par, PIN_CS, true);
+	udelay(5);
+}
+
+#define amoled_in_bitbang(par)	((par)->bitbang)
+#else
+#define amoled_in_bitbang(par)	false
+#endif
+
+/* --- bus -------------------------------------------------------------- */
+
+static int amoled_write_reg(struct amoled_fb *par, u8 cmd, const u8 *data,
+			    size_t len)
+{
+	struct spi_transfer xfers[2] = { };
+
+#if AMOLED_ESP32_DEBUG
+	if (par->bitbang) {
+		u8 b[4 + AMOLED_MAX_PARAMS] = { AMOLED_OP_WRITE_REG, 0, cmd, 0 };
+
+		if (len)
+			memcpy(b + 4, data, len);
+		amoled_bb_send(par, b, 4 + len);
+		return 0;
+	}
+#endif
+
+	par->hdr[0] = AMOLED_OP_WRITE_REG;
+	par->hdr[1] = 0;
+	par->hdr[2] = cmd;
+	par->hdr[3] = 0;
+	xfers[0].tx_buf = par->hdr;
+	xfers[0].len = 4;
+	if (len) {
+		memcpy(par->params, data, len);
+		xfers[1].tx_buf = par->params;
+		xfers[1].len = len;
+	}
+	return spi_sync_transfer(par->spi, xfers, len ? 2 : 1);
+}
+
+static unsigned int amoled_wires(const struct amoled_fb *par)
+{
+	if (pixel_wires == 1 || !(par->spi->mode & SPI_TX_QUAD))
+		return 1;
+	if (pixel_wires == 4)
+		return 4;
+	return par->pix_wires;
+}
+
+static int amoled_write_pixels(struct amoled_fb *par, bool first, size_t len)
+{
+	struct spi_transfer xfers[2] = { };
+	bool quad = amoled_wires(par) == 4;
+
+	par->hdr[0] = quad ? AMOLED_OP_WRITE_PIX4 : AMOLED_OP_WRITE_REG;
+	par->hdr[1] = 0;
+	par->hdr[2] = first ? AMOLED_CMD_RAMWR : AMOLED_CMD_RAMWRC;
+	par->hdr[3] = 0;
+	xfers[0].tx_buf = par->hdr;
+	xfers[0].len = 4;
+	xfers[1].tx_buf = par->txbuf;
+	xfers[1].len = len;
+	xfers[1].tx_nbits = quad ? SPI_NBITS_QUAD : SPI_NBITS_SINGLE;
+	return spi_sync_transfer(par->spi, xfers, 2);
+}
+
+static int amoled_run_cmds(struct amoled_fb *par, const struct amoled_cmd *cmds,
+			   unsigned int n)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < n; i++) {
+		ret = amoled_write_reg(par, cmds[i].cmd, cmds[i].data,
+				       cmds[i].len);
+		if (ret)
+			return ret;
+		if (cmds[i].delay_ms)
+			msleep(cmds[i].delay_ms);
+	}
+	return 0;
+}
+
+static int amoled_set_window(struct amoled_fb *par, u32 x1, u32 y1, u32 x2,
+			     u32 y2)
+{
+	u8 p[4];
+	int ret;
+
+	x1 += par->x_offset;
+	x2 += par->x_offset;
+	y1 += par->y_offset;
+	y2 += par->y_offset;
+
+	p[0] = x1 >> 8;
+	p[1] = x1;
+	p[2] = x2 >> 8;
+	p[3] = x2;
+	ret = amoled_write_reg(par, AMOLED_CMD_CASET, p, 4);
+	if (ret)
+		return ret;
+
+	p[0] = y1 >> 8;
+	p[1] = y1;
+	p[2] = y2 >> 8;
+	p[3] = y2;
+	return amoled_write_reg(par, AMOLED_CMD_RASET, p, 4);
+}
+
+/* Send a rectangle of the framebuffer to the panel. Caller holds io_lock. */
+static int amoled_send_rect(struct amoled_fb *par, u32 x1, u32 y1, u32 x2,
+			    u32 y2)
+{
+	const u8 *vmem = par->info->screen_buffer;
+	const u32 stride = par->info->fix.line_length;
+	size_t fill = 0;
+	bool first = true;
+	u32 y;
+	int ret;
+
+	/* the controller needs even start and odd end coordinates */
+	x1 &= ~1u;
+	y1 &= ~1u;
+	x2 |= 1u;
+	y2 |= 1u;
+	if (x2 >= par->width)
+		x2 = par->width - 1;
+	if (y2 >= par->height)
+		y2 = par->height - 1;
+
+	par->last_flush_px = (x2 - x1 + 1) * (y2 - y1 + 1);
+
+	ret = amoled_set_window(par, x1, y1, x2, y2);
+	if (ret)
+		return ret;
+
+	for (y = y1; y <= y2; y++) {
+		const u16 *src = (const u16 *)(vmem + y * stride) + x1;
+		u32 left = x2 - x1 + 1;
+
+		while (left) {
+			u32 n = min_t(u32, left, (AMOLED_TXBUF_SIZE - fill) / 2);
+			u16 *dst = (u16 *)(par->txbuf + fill);
+			u32 i;
+
+			/* the panel takes the high byte of each pixel first */
+			for (i = 0; i < n; i++)
+				dst[i] = swab16(src[i]);
+			src += n;
+			left -= n;
+			fill += n * 2;
+
+			if (fill == AMOLED_TXBUF_SIZE) {
+				ret = amoled_write_pixels(par, first, fill);
+				if (ret)
+					return ret;
+				first = false;
+				fill = 0;
+				cond_resched();
+			}
+		}
+	}
+	if (fill)
+		ret = amoled_write_pixels(par, first, fill);
+	return ret;
+}
+
+/* --- drawing ---------------------------------------------------------- */
+
+static void amoled_damage(struct amoled_fb *par, int x, int y, int w, int h)
+{
+	unsigned long flags;
+	int x2 = x + w - 1;
+	int y2 = y + h - 1;
+
+	if (x < 0)
+		x = 0;
+	if (y < 0)
+		y = 0;
+	if (x2 >= (int)par->width)
+		x2 = par->width - 1;
+	if (y2 >= (int)par->height)
+		y2 = par->height - 1;
+	if (x2 < x || y2 < y)
+		return;
+
+	spin_lock_irqsave(&par->dirty_lock, flags);
+	if (!par->dirty) {
+		par->dx1 = x;
+		par->dy1 = y;
+		par->dx2 = x2;
+		par->dy2 = y2;
+		par->dirty = true;
+	} else {
+		par->dx1 = min_t(u32, par->dx1, x);
+		par->dy1 = min_t(u32, par->dy1, y);
+		par->dx2 = max_t(u32, par->dx2, x2);
+		par->dy2 = max_t(u32, par->dy2, y2);
+	}
+	spin_unlock_irqrestore(&par->dirty_lock, flags);
+
+	schedule_delayed_work(&par->flush_work, msecs_to_jiffies(flush_delay_ms));
+}
+
+static void amoled_flush_work(struct work_struct *work)
+{
+	struct amoled_fb *par = container_of(to_delayed_work(work),
+					     struct amoled_fb, flush_work);
+	unsigned long flags;
+	u32 x1, y1, x2, y2;
+	ktime_t t0;
+	int ret;
+
+	/* a bit-bang session owns the pins: try again shortly */
+	if (amoled_in_bitbang(par)) {
+		schedule_delayed_work(&par->flush_work, msecs_to_jiffies(50));
+		return;
+	}
+
+	spin_lock_irqsave(&par->dirty_lock, flags);
+	if (!par->dirty) {
+		spin_unlock_irqrestore(&par->dirty_lock, flags);
+		return;
+	}
+	x1 = par->dx1;
+	y1 = par->dy1;
+	x2 = par->dx2;
+	y2 = par->dy2;
+	par->dirty = false;
+	spin_unlock_irqrestore(&par->dirty_lock, flags);
+
+	t0 = ktime_get();
+	mutex_lock(&par->io_lock);
+	ret = amoled_send_rect(par, x1, y1, x2, y2);
+	mutex_unlock(&par->io_lock);
+	par->last_flush_us = ktime_to_us(ktime_sub(ktime_get(), t0));
+	par->flushes++;
+	if (par->last_flush_px >= par->max_flush_px) {
+		par->max_flush_px = par->last_flush_px;
+		par->max_flush_us = par->last_flush_us;
+	}
+	if (ret)
+		dev_err_ratelimited(&par->spi->dev, "panel update failed: %d\n",
+				    ret);
+}
+
+/* --- fb_ops ----------------------------------------------------------- */
+
+static void amoled_fb_fillrect(struct fb_info *info,
+			       const struct fb_fillrect *rect)
+{
+	sys_fillrect(info, rect);
+	amoled_damage(info->par, rect->dx, rect->dy, rect->width, rect->height);
+}
+
+static void amoled_fb_copyarea(struct fb_info *info,
+			       const struct fb_copyarea *area)
+{
+	sys_copyarea(info, area);
+	amoled_damage(info->par, area->dx, area->dy, area->width, area->height);
+}
+
+static void amoled_fb_imageblit(struct fb_info *info,
+				const struct fb_image *image)
+{
+	sys_imageblit(info, image);
+	amoled_damage(info->par, image->dx, image->dy, image->width,
+		      image->height);
+}
+
+static ssize_t amoled_fb_write(struct fb_info *info, const char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	struct amoled_fb *par = info->par;
+	ssize_t ret = fb_sys_write(info, buf, count, ppos);
+
+	if (ret > 0)
+		amoled_damage(par, 0, 0, par->width, par->height);
+	return ret;
+}
+
+static int amoled_fb_check_var(struct fb_var_screeninfo *var,
+			       struct fb_info *info)
+{
+	/* one fixed mode: keep what the caller may change, force the rest */
+	var->xres = info->var.xres;
+	var->yres = info->var.yres;
+	var->xres_virtual = info->var.xres_virtual;
+	var->yres_virtual = info->var.yres_virtual;
+	var->xoffset = 0;
+	var->yoffset = 0;
+	var->bits_per_pixel = info->var.bits_per_pixel;
+	var->grayscale = 0;
+	var->nonstd = 0;
+	var->red = info->var.red;
+	var->green = info->var.green;
+	var->blue = info->var.blue;
+	var->transp = info->var.transp;
+	return 0;
+}
+
+static int amoled_fb_setcolreg(unsigned int regno, unsigned int red,
+			       unsigned int green, unsigned int blue,
+			       unsigned int transp, struct fb_info *info)
+{
+	u32 *pal = info->pseudo_palette;
+
+	if (regno >= 16)
+		return -EINVAL;
+	pal[regno] = ((red >> 11) << 11) | ((green >> 10) << 5) | (blue >> 11);
+	return 0;
+}
+
+static int amoled_fb_blank(int blank, struct fb_info *info)
+{
+	struct amoled_fb *par = info->par;
+	bool on = blank == FB_BLANK_UNBLANK;
+	int ret;
+
+	mutex_lock(&par->io_lock);
+	ret = amoled_write_reg(par, on ? AMOLED_CMD_DISPON : AMOLED_CMD_DISPOFF,
+			       NULL, 0);
+	if (!ret)
+		par->display_on = on;
+	mutex_unlock(&par->io_lock);
+	return ret;
+}
+
+static const struct fb_ops amoled_fb_ops = {
+	.owner		= THIS_MODULE,
+	.fb_read	= fb_sys_read,
+	.fb_write	= amoled_fb_write,
+	.fb_check_var	= amoled_fb_check_var,
+	.fb_setcolreg	= amoled_fb_setcolreg,
+	.fb_blank	= amoled_fb_blank,
+	.fb_fillrect	= amoled_fb_fillrect,
+	.fb_copyarea	= amoled_fb_copyarea,
+	.fb_imageblit	= amoled_fb_imageblit,
+};
+
+/* --- panel ------------------------------------------------------------ */
+
+static int amoled_panel_init(struct amoled_fb *par)
+{
+	const struct amoled_variant *v = par->variant;
+	int ret;
+
+	gpiod_set_value_cansleep(par->enable, 1);
+	msleep(20);
+
+	gpiod_set_value_cansleep(par->reset, 1);	/* assert: pin low */
+	msleep(10);
+	gpiod_set_value_cansleep(par->reset, 0);
+	msleep(150);
+
+	mutex_lock(&par->io_lock);
+
+	/* RGB order, 16 bits per pixel; the vendor driver sends these first */
+	ret = amoled_write_reg(par, AMOLED_CMD_MADCTL, (const u8 []){ 0x00 }, 1);
+	if (!ret)
+		ret = amoled_write_reg(par, AMOLED_CMD_COLMOD,
+				       (const u8 []){ 0x55 }, 1);
+	if (!ret)
+		ret = amoled_run_cmds(par, v->pre, v->n_pre);
+
+	/* fill the panel's frame memory (black at probe) before it lights up */
+	if (!ret && !amoled_in_bitbang(par))
+		ret = amoled_send_rect(par, 0, 0, par->width - 1,
+				       par->height - 1);
+	if (!ret)
+		ret = amoled_run_cmds(par, v->post, v->n_post);
+	if (!ret)
+		ret = amoled_write_reg(par, AMOLED_CMD_WRDISBV, &par->brightness, 1);
+	if (!ret)
+		par->display_on = true;
+
+	mutex_unlock(&par->io_lock);
+	return ret;
+}
+
+static void amoled_panel_off(struct amoled_fb *par)
+{
+	mutex_lock(&par->io_lock);
+	amoled_write_reg(par, AMOLED_CMD_DISPOFF, NULL, 0);
+	msleep(20);
+	amoled_write_reg(par, AMOLED_CMD_SLPIN, NULL, 0);
+	msleep(120);
+	mutex_unlock(&par->io_lock);
+	gpiod_set_value_cansleep(par->enable, 0);
+}
+
+/* --- sysfs ------------------------------------------------------------ */
+
+static ssize_t brightness_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", par->brightness);
+}
+
+static ssize_t brightness_store(struct device *dev,
+				struct device_attribute *attr, const char *buf,
+				size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	u8 val;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	mutex_lock(&par->io_lock);
+	ret = amoled_write_reg(par, AMOLED_CMD_WRDISBV, &val, 1);
+	if (!ret)
+		par->brightness = val;
+	mutex_unlock(&par->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(brightness);
+
+/* echo 1 > refresh: send the whole framebuffer to the panel again */
+static ssize_t refresh_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+
+	amoled_damage(par, 0, 0, par->width, par->height);
+	return count;
+}
+static DEVICE_ATTR_WO(refresh);
+
+/* echo 1 > reinit: power the panel up again and run its init sequence */
+static ssize_t reinit_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	int ret = amoled_panel_init(par);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(reinit);
+
+/*
+ * echo "23" > cmd        all pixels on (no pixel data needed: tests power,
+ *                        reset and the register path alone)
+ * echo "13" > cmd        back to normal display
+ * echo "51 80" > cmd     register 0x51 with one parameter, all values hex
+ */
+static ssize_t cmd_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	u8 b[1 + AMOLED_MAX_PARAMS];
+	unsigned int n = 0;
+	const char *p = buf;
+	int ret;
+
+	while (n < ARRAY_SIZE(b)) {
+		char tok[3] = { };
+		unsigned long v;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!isxdigit(*p))
+			break;
+		tok[0] = *p++;
+		if (isxdigit(*p))
+			tok[1] = *p++;
+		if (kstrtoul(tok, 16, &v))
+			return -EINVAL;
+		b[n++] = v;
+	}
+	if (!n)
+		return -EINVAL;
+
+	mutex_lock(&par->io_lock);
+	ret = amoled_write_reg(par, b[0], b + 1, n - 1);
+	mutex_unlock(&par->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(cmd);
+
+static ssize_t flush_stats_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u flushes; last %u px in %u us; largest %u px in %u us\n",
+			  par->flushes, par->last_flush_px, par->last_flush_us,
+			  par->max_flush_px, par->max_flush_us);
+}
+static DEVICE_ATTR_RO(flush_stats);
+
+#if AMOLED_ESP32_DEBUG
+static int amoled_parse_hex(const char *p, u8 *b, unsigned int max)
+{
+	unsigned int n = 0;
+
+	while (n < max) {
+		char tok[3] = { };
+		unsigned long v;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!isxdigit(*p))
+			break;
+		tok[0] = *p++;
+		if (isxdigit(*p))
+			tok[1] = *p++;
+		if (kstrtoul(tok, 16, &v))
+			return -EINVAL;
+		b[n++] = v;
+	}
+	return n ? n : -EINVAL;
+}
+
+/* cat regdump: pads, GPIO matrix, GPIO and SPI2 registers, and the level on each pad */
+static ssize_t regdump_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	unsigned int i;
+	int len = 0;
+
+	mutex_lock(&par->io_lock);
+	for (i = 0; i < ARRAY_SIZE(amoled_dbg_pins); i++) {
+		unsigned int pin = amoled_dbg_pins[i];
+		void __iomem *mx = par->dbg_iomux + ES_IOMUX_GPIO(pin);
+		u32 mux = readl(mx);
+		u32 sel = readl(par->dbg_gpio + ES_GPIO_FUNC_OUT_SEL(pin));
+		int lvl;
+
+		/* input enable on for a moment, so the pad level can be read */
+		writel(mux | ES_FUN_IE, mx);
+		udelay(5);
+		lvl = es_pin_in(par, pin);
+		writel(mux, mx);
+
+		len += sysfs_emit_at(buf, len,
+				     "GPIO%-2u iomux=%08x (func %u ie %u drv %u)  out_sel=%03x (signal %u inv %u oen_sel %u oen_inv %u)  pad=%d\n",
+				     pin, mux, (mux >> 12) & 7, (mux >> 9) & 1,
+				     (mux >> 10) & 3, sel, sel & 0x1ff,
+				     (sel >> 9) & 1, (sel >> 10) & 1,
+				     (sel >> 11) & 1, lvl);
+	}
+	len += sysfs_emit_at(buf, len,
+			     "GPIO OUT=%08x OUT1=%08x ENABLE=%08x ENABLE1=%08x IN=%08x IN1=%08x\n",
+			     readl(par->dbg_gpio + ES_GPIO_OUT),
+			     readl(par->dbg_gpio + ES_GPIO_OUT1),
+			     readl(par->dbg_gpio + ES_GPIO_ENABLE),
+			     readl(par->dbg_gpio + ES_GPIO_ENABLE1),
+			     readl(par->dbg_gpio + ES_GPIO_IN),
+			     readl(par->dbg_gpio + ES_GPIO_IN1));
+	len += sysfs_emit_at(buf, len,
+			     "SPI2 CMD=%08x CTRL=%08x CLOCK=%08x USER=%08x USER1=%08x MISC=%08x DLEN=%08x CLK_GATE=%08x\n",
+			     readl(par->dbg_spi2 + 0x00), readl(par->dbg_spi2 + 0x08),
+			     readl(par->dbg_spi2 + 0x0c), readl(par->dbg_spi2 + 0x10),
+			     readl(par->dbg_spi2 + 0x14), readl(par->dbg_spi2 + 0x20),
+			     readl(par->dbg_spi2 + 0x1c), readl(par->dbg_spi2 + 0xe8));
+	mutex_unlock(&par->io_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(regdump);
+
+/*
+ * cat engine_probe: program SPI2 by hand for one 32-bit write at 1 MHz, for a few
+ * combinations of MISC (CS enable and polarity, CS_KEEP_ACTIVE) and USER
+ * (CS_SETUP/CS_HOLD), and report every change of the CS and CLK pads during it,
+ * with the time in microseconds. Shows whether, and how, the engine moves CS.
+ */
+#define SPI_R_CMD	0x00
+#define SPI_R_CLOCK	0x0c
+#define SPI_R_USER	0x10
+#define SPI_R_USER1	0x14
+#define SPI_R_DLEN	0x1c
+#define SPI_R_MISC	0x20
+#define SPI_R_W0	0x98
+
+static int amoled_probe_one(struct amoled_fb *par, u32 misc, u32 user, char *buf,
+			    int len)
+{
+	void __iomem *s = par->dbg_spi2;
+	u32 saved_misc = readl(s + SPI_R_MISC), saved_user = readl(s + SPI_R_USER);
+	u32 saved_clock = readl(s + SPI_R_CLOCK), saved_dlen = readl(s + SPI_R_DLEN);
+	u32 mux9 = readl(par->dbg_iomux + ES_IOMUX_GPIO(PIN_CS));
+	u32 mux10 = readl(par->dbg_iomux + ES_IOMUX_GPIO(PIN_CLK));
+	struct { u32 us; u8 pins; } ev[24];
+	unsigned int n = 0, tries;
+	u8 last, now;
+	u32 t0;
+
+	writel(mux9 | ES_FUN_IE, par->dbg_iomux + ES_IOMUX_GPIO(PIN_CS));
+	writel(mux10 | ES_FUN_IE, par->dbg_iomux + ES_IOMUX_GPIO(PIN_CLK));
+
+	writel(misc, s + SPI_R_MISC);
+	/* 80 MHz / 2 / 40: CLKDIV_PRE [21:18] = 1, CLKCNT_N [17:12] = L [5:0] = 39, H [11:6] = 19 */
+	writel((1 << 18) | (39 << 12) | (19 << 6) | 39, s + SPI_R_CLOCK);
+	writel(user, s + SPI_R_USER);
+	writel(31, s + SPI_R_DLEN);
+	writel(0x02002300, s + SPI_R_W0);
+	writel(BIT(23), s + SPI_R_CMD);			/* update */
+	for (tries = 1000; (readl(s + SPI_R_CMD) & BIT(23)) && --tries;)
+		udelay(1);
+	udelay(20);
+
+	t0 = ktime_to_us(ktime_get());
+	last = (readl(par->dbg_gpio + ES_GPIO_IN) >> PIN_CS) & 3;	/* CS, CLK */
+	ev[n].us = 0;
+	ev[n++].pins = last;
+	writel(BIT(24), s + SPI_R_CMD);			/* start */
+	for (tries = 20000; (readl(s + SPI_R_CMD) & BIT(24)) && --tries;) {
+		now = (readl(par->dbg_gpio + ES_GPIO_IN) >> PIN_CS) & 3;
+		if (now != last && n < ARRAY_SIZE(ev) - 1) {
+			ev[n].us = ktime_to_us(ktime_get()) - t0;
+			ev[n++].pins = now;
+		}
+		last = now;
+	}
+	udelay(30);
+	now = (readl(par->dbg_gpio + ES_GPIO_IN) >> PIN_CS) & 3;
+	ev[n].us = ktime_to_us(ktime_get()) - t0;
+	ev[n++].pins = now;
+
+	len += sysfs_emit_at(buf, len, "MISC %08x USER %08x:", misc, user);
+	for (tries = 0; tries < n; tries++)
+		len += sysfs_emit_at(buf, len, " [+%uus CS%u CLK%u]", ev[tries].us,
+				     ev[tries].pins & 1, (ev[tries].pins >> 1) & 1);
+	len += sysfs_emit_at(buf, len, "\n");
+
+	writel(saved_misc, s + SPI_R_MISC);
+	writel(saved_clock, s + SPI_R_CLOCK);
+	writel(saved_user, s + SPI_R_USER);
+	writel(saved_dlen, s + SPI_R_DLEN);
+	writel(BIT(23), s + SPI_R_CMD);
+	writel(mux9, par->dbg_iomux + ES_IOMUX_GPIO(PIN_CS));
+	writel(mux10, par->dbg_iomux + ES_IOMUX_GPIO(PIN_CLK));
+	return len;
+}
+
+static ssize_t engine_probe_show(struct device *dev, struct device_attribute *attr,
+				 char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	/* USER bits: 0 DOUTDIN, 6 CS_HOLD, 7 CS_SETUP, 27 USR_MOSI */
+	const u32 base = BIT(27) | BIT(0);
+	const u32 hs = BIT(6) | BIT(7);
+	int len = 0;
+
+	mutex_lock(&par->io_lock);
+	len = amoled_probe_one(par, 0x0000003e, base | hs, buf, len);
+	len = amoled_probe_one(par, 0x0000003e, base, buf, len);
+	len = amoled_probe_one(par, 0x4000003e, base, buf, len);
+	len = amoled_probe_one(par, 0x000000be, base, buf, len);
+	len = amoled_probe_one(par, 0x000000be, base | hs, buf, len);
+	len = amoled_probe_one(par, 0x00000000, base, buf, len);
+	mutex_unlock(&par->io_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(engine_probe);
+
+/*
+ * echo 1 > in_connect: also route the SPI2 *input* signals to the same pads, the
+ * way the ESP-IDF SPI master does (GPIO matrix input select, bit 7 = through the
+ * matrix), and turn the pads' input enable on. 0 puts the previous values back.
+ */
+static ssize_t in_connect_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	static const struct { u16 sig; u8 pin; } m[] = {
+		{ 101, 10 },	/* FSPICLK */
+		{ 102, 12 },	/* FSPIQ   */
+		{ 103, 11 },	/* FSPID   */
+		{ 104, 14 },	/* FSPIHD  */
+		{ 105, 13 },	/* FSPIWP  */
+		{ 110, 9 },	/* FSPICS0 */
+	};
+	static u32 saved_in[ARRAY_SIZE(m)], saved_mux[ARRAY_SIZE(m)];
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	unsigned int i;
+	bool on;
+	int ret = kstrtobool(buf, &on);
+
+	if (ret)
+		return ret;
+	mutex_lock(&par->io_lock);
+	for (i = 0; i < ARRAY_SIZE(m); i++) {
+		void __iomem *in = par->dbg_gpio + 0x154 + 4 * m[i].sig;
+		void __iomem *mx = par->dbg_iomux + ES_IOMUX_GPIO(m[i].pin);
+
+		if (on) {
+			saved_in[i] = readl(in);
+			saved_mux[i] = readl(mx);
+			writel(m[i].pin | BIT(7), in);
+			writel(saved_mux[i] | ES_FUN_IE, mx);
+		} else {
+			writel(saved_in[i], in);
+			writel(saved_mux[i], mx);
+		}
+	}
+	mutex_unlock(&par->io_lock);
+	return count;
+}
+static DEVICE_ATTR_WO(in_connect);
+
+/* the SPI driver's bring-up trace (drivers/spi/spi-esp32.c) */
+struct esp32_spi_dbg_event {
+	u32 us;
+	u8 pins;
+	char tag;
+};
+extern void __iomem *esp32_spi_dbg_gpio_in;
+extern struct esp32_spi_dbg_event esp32_spi_dbg_ev[128];
+extern unsigned int esp32_spi_dbg_n;
+
+/*
+ * cat cstrace: one NOP register write at 100 kHz (so it lasts a few hundred
+ * microseconds), with the CS, CLK and D0 pads sampled at the key points inside
+ * the SPI driver: D/A = CS deassert/assert requested, d/a = applied,
+ * S/E = transfer start/end, w = a change seen while waiting.
+ */
+static ssize_t cstrace_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	u32 old_hz = par->spi->max_speed_hz;
+	u32 mux[3];
+	u8 before;
+	unsigned int i;
+	int len = 0, ret;
+
+	mutex_lock(&par->io_lock);
+	for (i = 0; i < 3; i++) {
+		mux[i] = readl(par->dbg_iomux + ES_IOMUX_GPIO(PIN_CS + i));
+		writel(mux[i] | ES_FUN_IE, par->dbg_iomux + ES_IOMUX_GPIO(PIN_CS + i));
+	}
+	udelay(10);
+	before = (readl(par->dbg_gpio + ES_GPIO_IN) >> 9) & 7;
+
+	par->spi->max_speed_hz = 100000;
+	esp32_spi_dbg_n = 0;
+	esp32_spi_dbg_gpio_in = par->dbg_gpio + ES_GPIO_IN;
+	ret = amoled_write_reg(par, 0x00, NULL, 0);
+	esp32_spi_dbg_gpio_in = NULL;
+	par->spi->max_speed_hz = old_hz;
+
+	for (i = 0; i < 3; i++)
+		writel(mux[i], par->dbg_iomux + ES_IOMUX_GPIO(PIN_CS + i));
+
+	len += sysfs_emit_at(buf, len, "write returned %d, %u events. before: CS %u CLK %u D0 %u\n",
+			     ret, esp32_spi_dbg_n, before & 1, (before >> 1) & 1,
+			     (before >> 2) & 1);
+	for (i = 0; i < esp32_spi_dbg_n; i++) {
+		struct esp32_spi_dbg_event *e = &esp32_spi_dbg_ev[i];
+
+		len += sysfs_emit_at(buf, len, "+%6u us  %c   CS %u CLK %u D0 %u\n",
+				     e->us - esp32_spi_dbg_ev[0].us, e->tag,
+				     e->pins & 1, (e->pins >> 1) & 1, (e->pins >> 2) & 1);
+	}
+	mutex_unlock(&par->io_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(cstrace);
+
+/*
+ * cat misc_sweep: write a few values to SPI2's MISC register (CS enables and
+ * polarity, CS_KEEP_ACTIVE, clock disable) and read the CS, CLK, D0 and D1 pads
+ * after each, then put the register back. Needs the pads' output enable forced
+ * on (echo 1 > oe_force) to be meaningful.
+ */
+static ssize_t misc_sweep_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	static const struct { u32 val; const char *what; } v[] = {
+		{ 0x0000003e, "as configured: CS0 on, CS1-5 off" },
+		{ 0x4000003e, "+ CS_KEEP_ACTIVE (bit 30)" },
+		{ 0x0000003f, "CS0 off too (bit 0)" },
+		{ 0x0000007f, "all CS off" },
+		{ 0x000000be, "+ CS0 polarity (bit 7)" },
+		{ 0x0000007e, "+ clock off (bit 6)" },
+		{ 0x2000003e, "+ clock idle edge (bit 29)" },
+		{ 0x00000000, "all CS on" },
+	};
+	static const u8 pins[4] = { PIN_CS, PIN_CLK, PIN_D0, 12 };
+	u32 saved_misc = readl(par->dbg_spi2 + 0x20);
+	u32 mux[4];
+	unsigned int i, j;
+	int len = 0;
+
+	mutex_lock(&par->io_lock);
+	for (j = 0; j < 4; j++) {
+		mux[j] = readl(par->dbg_iomux + ES_IOMUX_GPIO(pins[j]));
+		writel(mux[j] | ES_FUN_IE, par->dbg_iomux + ES_IOMUX_GPIO(pins[j]));
+	}
+	len += sysfs_emit_at(buf, len, "MISC value   CS CLK D0 D1   meaning\n");
+	for (i = 0; i < ARRAY_SIZE(v); i++) {
+		int lv[4];
+
+		unsigned int tries = 1000;
+
+		writel(v[i].val, par->dbg_spi2 + 0x20);
+		/* SPI_UPDATE (CMD bit 23): hand the new MISC to the SPI module */
+		writel(BIT(23), par->dbg_spi2 + 0x00);
+		while ((readl(par->dbg_spi2 + 0x00) & BIT(23)) && --tries)
+			udelay(1);
+		udelay(20);
+		for (j = 0; j < 4; j++)
+			lv[j] = es_pin_in(par, pins[j]);
+		len += sysfs_emit_at(buf, len, "%08x   %3d %3d %2d %2d   %s\n",
+				     v[i].val, lv[0], lv[1], lv[2], lv[3], v[i].what);
+	}
+	writel(saved_misc, par->dbg_spi2 + 0x20);
+	writel(BIT(23), par->dbg_spi2 + 0x00);
+	for (j = 0; j < 4; j++)
+		writel(mux[j], par->dbg_iomux + ES_IOMUX_GPIO(pins[j]));
+	mutex_unlock(&par->io_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(misc_sweep);
+
+/*
+ * echo 1 > oe_force: pads 9..14 keep the SPI engine's signals, but their output
+ * enable now comes from GPIO_ENABLE (always on). 0 gives it back to the engine.
+ * Tells "the engine drives CS low when idle" from "the engine leaves CS floating".
+ */
+static ssize_t oe_force_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	unsigned int i;
+	bool on;
+	int ret = kstrtobool(buf, &on);
+
+	if (ret)
+		return ret;
+	mutex_lock(&par->io_lock);
+	for (i = 0; i < 6; i++) {
+		void __iomem *r = par->dbg_gpio + ES_GPIO_FUNC_OUT_SEL(9 + i);
+		u32 sel = readl(r);
+
+		writel(on ? sel | BIT(10) : sel & ~BIT(10), r);
+		es_pin_oe(par, 9 + i, on);
+	}
+	mutex_unlock(&par->io_lock);
+	return count;
+}
+static DEVICE_ATTR_WO(oe_force);
+
+/*
+ * cat cstest: the CS, CLK and D0 pad levels around one register write (a NOP)
+ * by the SPI engine. CS should be high before, and high again right after.
+ */
+static ssize_t cstest_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	static const u8 pins[3] = { PIN_CS, PIN_CLK, PIN_D0 };
+	u32 mux[3];
+	int a[3], b[3], c[3], d[3];
+	unsigned int i;
+	int ret, len = 0;
+
+	mutex_lock(&par->io_lock);
+	for (i = 0; i < 3; i++) {
+		mux[i] = readl(par->dbg_iomux + ES_IOMUX_GPIO(pins[i]));
+		writel(mux[i] | ES_FUN_IE, par->dbg_iomux + ES_IOMUX_GPIO(pins[i]));
+	}
+	udelay(10);
+	for (i = 0; i < 3; i++)
+		a[i] = es_pin_in(par, pins[i]);
+
+	ret = amoled_write_reg(par, 0x00, NULL, 0);	/* DCS NOP */
+	for (i = 0; i < 3; i++)
+		b[i] = es_pin_in(par, pins[i]);
+	udelay(100);
+	for (i = 0; i < 3; i++)
+		c[i] = es_pin_in(par, pins[i]);
+	mdelay(2);
+	for (i = 0; i < 3; i++)
+		d[i] = es_pin_in(par, pins[i]);
+
+	for (i = 0; i < 3; i++)
+		writel(mux[i], par->dbg_iomux + ES_IOMUX_GPIO(pins[i]));
+	len += sysfs_emit_at(buf, len,
+			     "write returned %d; MISC=%08x USER=%08x cs_hold param affects USER bits 6,7\n",
+			     ret, readl(par->dbg_spi2 + 0x20), readl(par->dbg_spi2 + 0x10));
+	len += sysfs_emit_at(buf, len,
+			     "          before  right-after  +100us  +2ms\n");
+	for (i = 0; i < 3; i++)
+		len += sysfs_emit_at(buf, len, "GPIO%-2u %6d %11d %7d %5d\n",
+				     pins[i], a[i], b[i], c[i], d[i]);
+	mutex_unlock(&par->io_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(cstest);
+
+/*
+ * cat padtest: for each of the six SPI pads, the level with nothing driving it
+ * (shows an external pull), and whether the pad follows when driven high and low.
+ * CS stays high and is never pulled low, so the panel sees no frame.
+ */
+static ssize_t padtest_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	unsigned int i;
+	int len = 0;
+
+	mutex_lock(&par->io_lock);
+	amoled_bb_begin(par);	/* all six driven: CS high, CLK low, D0 low, D1-D3 high */
+	for (i = 0; i < 6; i++) {
+		unsigned int pin = 9 + i;
+		void __iomem *mx = par->dbg_iomux + ES_IOMUX_GPIO(pin);
+		u32 mux = readl(mx);
+		bool idle_hi = pin == PIN_CS || pin >= 12;
+		int fl, hi, lo = -1;
+
+		writel(mux | ES_FUN_IE, mx);
+		es_pin_oe(par, pin, false);
+		udelay(100);
+		fl = es_pin_in(par, pin);
+
+		es_pin_set(par, pin, true);
+		es_pin_oe(par, pin, true);
+		udelay(10);
+		hi = es_pin_in(par, pin);
+		if (pin != PIN_CS) {
+			es_pin_set(par, pin, false);
+			udelay(10);
+			lo = es_pin_in(par, pin);
+		}
+		es_pin_set(par, pin, idle_hi);	/* back to the idle level, still driven */
+		writel(mux, mx);
+
+		len += sysfs_emit_at(buf, len,
+				     "GPIO%-2u not driven: %d   driven high: %d   driven low: %d\n",
+				     pin, fl, hi, lo);
+	}
+	amoled_bb_end(par);
+	mutex_unlock(&par->io_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(padtest);
+
+/* echo 1 > bbinit: the whole init sequence, register writes by bit-banging */
+static ssize_t bbinit_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	int ret;
+
+	amoled_bb_begin(par);
+	ret = amoled_panel_init(par);
+	amoled_bb_end(par);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(bbinit);
+
+/* echo "23" > bbcmd: one register write by bit-banging */
+static ssize_t bbcmd_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct amoled_fb *par = dev_get_drvdata(dev);
+	u8 b[1 + AMOLED_MAX_PARAMS];
+	int n = amoled_parse_hex(buf, b, ARRAY_SIZE(b));
+
+	if (n < 0)
+		return n;
+	mutex_lock(&par->io_lock);
+	amoled_bb_begin(par);
+	amoled_write_reg(par, b[0], b + 1, n - 1);
+	amoled_bb_end(par);
+	mutex_unlock(&par->io_lock);
+	return count;
+}
+static DEVICE_ATTR_WO(bbcmd);
+#endif
+
+static struct attribute *amoled_attrs[] = {
+	&dev_attr_brightness.attr,
+	&dev_attr_refresh.attr,
+	&dev_attr_reinit.attr,
+	&dev_attr_cmd.attr,
+	&dev_attr_flush_stats.attr,
+#if AMOLED_ESP32_DEBUG
+	&dev_attr_regdump.attr,
+	&dev_attr_padtest.attr,
+	&dev_attr_cstest.attr,
+	&dev_attr_oe_force.attr,
+	&dev_attr_misc_sweep.attr,
+	&dev_attr_cstrace.attr,
+	&dev_attr_in_connect.attr,
+	&dev_attr_engine_probe.attr,
+	&dev_attr_bbinit.attr,
+	&dev_attr_bbcmd.attr,
+#endif
+	NULL
+};
+ATTRIBUTE_GROUPS(amoled);
+
+/* --- driver ----------------------------------------------------------- */
+
+static int amoled_fb_probe(struct spi_device *spi)
+{
+	struct device *dev = &spi->dev;
+	const struct amoled_variant *variant;
+	struct fb_info *info;
+	struct amoled_fb *par;
+	size_t len;
+	void *vmem;
+	u32 val;
+	int ret;
+
+	variant = spi_get_device_match_data(spi);
+	if (!variant)
+		return -ENODEV;
+
+	info = framebuffer_alloc(sizeof(*par), dev);
+	if (!info)
+		return -ENOMEM;
+	par = info->par;
+	par->info = info;
+	par->spi = spi;
+	par->variant = variant;
+	par->width = 466;
+	par->height = 466;
+	par->x_offset = variant->x_offset;
+	par->y_offset = 0;
+	par->brightness = 0xff;
+	mutex_init(&par->io_lock);
+	spin_lock_init(&par->dirty_lock);
+	INIT_DELAYED_WORK(&par->flush_work, amoled_flush_work);
+
+	if (!device_property_read_u32(dev, "width", &val))
+		par->width = val;
+	if (!device_property_read_u32(dev, "height", &val))
+		par->height = val;
+	if (!device_property_read_u32(dev, "x-offset", &val))
+		par->x_offset = val;
+	if (!device_property_read_u32(dev, "y-offset", &val))
+		par->y_offset = val;
+	if (!par->width || !par->height || (par->width | par->height) & 1) {
+		dev_err(dev, "width and height must be even and non-zero\n");
+		ret = -EINVAL;
+		goto err_release;
+	}
+
+	par->pix_wires = (spi->mode & SPI_TX_QUAD) ? 4 : 1;
+	if (!device_property_read_u32(dev, "pixel-wires", &val) && val == 1)
+		par->pix_wires = 1;
+
+	par->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(par->reset)) {
+		ret = dev_err_probe(dev, PTR_ERR(par->reset), "reset gpio\n");
+		goto err_release;
+	}
+	par->enable = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_LOW);
+	if (IS_ERR(par->enable)) {
+		ret = dev_err_probe(dev, PTR_ERR(par->enable), "enable gpio\n");
+		goto err_release;
+	}
+
+	spi->bits_per_word = 8;
+	ret = spi_setup(spi);
+	if (ret) {
+		dev_err_probe(dev, ret, "spi setup\n");
+		goto err_release;
+	}
+
+	par->txbuf = devm_kmalloc(dev, AMOLED_TXBUF_SIZE, GFP_KERNEL);
+	if (!par->txbuf) {
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	/* One physically contiguous block: there is no MMU to stitch pages. */
+	len = PAGE_ALIGN(par->width * par->height * 2);
+	vmem = alloc_pages_exact(len, GFP_KERNEL | __GFP_ZERO);
+	if (!vmem) {
+		dev_err(dev, "no memory for a %zu byte framebuffer\n", len);
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	info->fbops = &amoled_fb_ops;
+	info->flags = FBINFO_VIRTFB | FBINFO_READS_FAST;
+	info->screen_buffer = vmem;
+	info->screen_size = par->width * par->height * 2;
+	info->pseudo_palette = par->palette;
+
+	strscpy(info->fix.id, "amoled-qspi", sizeof(info->fix.id));
+	info->fix.type = FB_TYPE_PACKED_PIXELS;
+	info->fix.visual = FB_VISUAL_TRUECOLOR;
+	info->fix.line_length = par->width * 2;
+	info->fix.smem_len = info->screen_size;
+
+	info->var.xres = par->width;
+	info->var.yres = par->height;
+	info->var.xres_virtual = par->width;
+	info->var.yres_virtual = par->height;
+	info->var.bits_per_pixel = 16;
+	info->var.red.offset = 11;
+	info->var.red.length = 5;
+	info->var.green.offset = 5;
+	info->var.green.length = 6;
+	info->var.blue.offset = 0;
+	info->var.blue.length = 5;
+	info->var.activate = FB_ACTIVATE_NOW;
+	info->var.vmode = FB_VMODE_NONINTERLACED;
+	info->var.height = -1;
+	info->var.width = -1;
+
+	spi_set_drvdata(spi, par);
+
+#if AMOLED_ESP32_DEBUG
+	par->dbg_gpio = ioremap(ES_GPIO_BASE, 0x700);
+	par->dbg_iomux = ioremap(ES_IOMUX_BASE, 0x100);
+	par->dbg_spi2 = ioremap(ES_SPI2_BASE, 0x100);
+#endif
+
+	ret = amoled_panel_init(par);
+	if (ret) {
+		dev_err_probe(dev, ret, "panel init\n");
+		goto err_free_vmem;
+	}
+
+	ret = register_framebuffer(info);
+	if (ret) {
+		dev_err_probe(dev, ret, "register framebuffer\n");
+		goto err_panel_off;
+	}
+
+	dev_info(dev, "%s %ux%u (x offset %u), %u-wire pixels, fb%d\n",
+		 variant->name, par->width, par->height, par->x_offset,
+		 par->pix_wires, info->node);
+	return 0;
+
+err_panel_off:
+	amoled_panel_off(par);
+err_free_vmem:
+	free_pages_exact(vmem, len);
+err_release:
+	framebuffer_release(info);
+	return ret;
+}
+
+static void amoled_fb_remove(struct spi_device *spi)
+{
+	struct amoled_fb *par = spi_get_drvdata(spi);
+	struct fb_info *info = par->info;
+
+	unregister_framebuffer(info);
+	cancel_delayed_work_sync(&par->flush_work);
+	amoled_panel_off(par);
+	free_pages_exact(info->screen_buffer, PAGE_ALIGN(info->screen_size));
+	framebuffer_release(info);
+}
+
+static const struct of_device_id amoled_fb_of_match[] = {
+	{ .compatible = "waveshare,amoled-1.43-co5300", .data = &co5300_variant },
+	{ .compatible = "waveshare,amoled-1.43-sh8601", .data = &sh8601_variant },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, amoled_fb_of_match);
+
+static const struct spi_device_id amoled_fb_id[] = {
+	{ "amoled-1.43-co5300", (kernel_ulong_t)&co5300_variant },
+	{ "amoled-1.43-sh8601", (kernel_ulong_t)&sh8601_variant },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, amoled_fb_id);
+
+static struct spi_driver amoled_fb_driver = {
+	.driver = {
+		.name = "amoled-qspi-fb",
+		.of_match_table = amoled_fb_of_match,
+		.dev_groups = amoled_groups,
+	},
+	.id_table = amoled_fb_id,
+	.probe = amoled_fb_probe,
+	.remove = amoled_fb_remove,
+};
+module_spi_driver(amoled_fb_driver);
+
+MODULE_DESCRIPTION("Quad-SPI AMOLED (SH8601/CO5300) framebuffer driver");
+MODULE_LICENSE("GPL");

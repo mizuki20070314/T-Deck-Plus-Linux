@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/keyboard/lilygo,t-deck-keyboard.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: LilyGO T-Deck I2C keyboard
+
+maintainers:
+  - OpenAI <noreply@openai.com>
+
+description:
+  The T-Deck keyboard is scanned by a separate MCU and reports one ASCII
+  character per I2C read at address 0x55.
+
+properties:
+  compatible:
+    const: lilygo,t-deck-keyboard
+
+  reg:
+    const: 0x55
+
+  poll-interval-ms:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 5
+    maximum: 100
+    default: 10
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        keyboard@55 {
+            compatible = "lilygo,t-deck-keyboard";
+            reg = <0x55>;
+            poll-interval-ms = <10>;
+        };
+    };

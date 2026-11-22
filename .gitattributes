@@ -1,0 +1,8 @@
+# Keep shell scripts and sources LF even on Windows: a CRLF shebang
+# (#!/bin/sh\r) makes the board say "cannot execute: required file not found".
+* text=auto eol=lf
+
+# Binary files (if ever added) must never be normalized.
+*.png binary
+*.jpg binary
+*.bin binary

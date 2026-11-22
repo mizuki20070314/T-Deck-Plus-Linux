@@ -1,0 +1,34 @@
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c
++++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c
+@@ -126,5 +128,5 @@ int sta_connection(uint8_t *bssid)
+ 	}
+ 	memcpy(ap_bssid, bssid, MAC_ADDR_LEN);
+-	esp_wifi_connect_internal(ap_bssid);
++	esp_wifi_connect();
+ 
+ 	return ESP_OK;
+@@ -1110,5 +1113,5 @@ int process_auth_request(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
+ 		/* WPA3 specific */
+ 		ESP_LOGI(TAG, "AUTH Confirm\n");
+-		esp_wifi_issue_auth_internal(0);
++		// esp_wifi_issue_auth_internal is not exported by the pinned ESP-IDF build
+ 
+ 	} else {
+@@ -1254,5 +1257,5 @@ int process_assoc_request(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
+ 	}
+ 
+-	esp_wifi_issue_assoc_internal(0);
++	// esp_wifi_issue_assoc_internal is not exported by the pinned ESP-IDF build
+ 
+ 	buf_handle.if_type = if_type;
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/esp_wifi_driver.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/esp_wifi_driver.h
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/esp_wifi_driver.h
++++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/esp_wifi_driver.h
+@@ -302,5 +302,5 @@ bool esp_wifi_ap_is_sta_sae_reauth_node(uint8_t *mac);
+ uint8_t* esp_wifi_sta_get_sae_identifier_internal(void);
+ bool esp_wifi_eb_tx_status_success_internal(void *eb);
+-esp_err_t esp_wifi_connect_internal(const uint8_t *bssid);
++esp_err_t esp_wifi_connect_internal(void);
+ esp_err_t esp_wifi_issue_auth_internal(uint8_t status);
+ esp_err_t esp_wifi_issue_assoc_internal(uint8_t status);

@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: builder <builder@esp32-repro>
+Date: Sat, 31 Oct 2026 01:09:08 +0900
+Subject: [PATCH 1/3] spi: esp32: support dual and quad writes, and frame
+ messages with CS
+
+Honour the per-transfer tx_nbits: set SPI_FWRITE_DUAL / SPI_FWRITE_QUAD for the
+data phase, drop full duplex for multi-line writes, and idle all four data
+lines high for quad devices like the ESP-IDF SPI master does. Multi-line reads
+were advertised but never implemented, so stop advertising them.
+
+Chip select never moved: set_cs wrote MISC without an update, and clearing
+CS_KEEP_ACTIVE does not release CS by itself, so CS stayed low for good. Apply
+the change with an update and disable the CS line on release. CS now idles
+inactive, is asserted for a message and released at its end. A device that
+frames its commands with CS (the AMOLED panel) ignores everything otherwise.
+---
+ drivers/spi/spi-esp32.c | 49 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/spi/spi-esp32.c b/drivers/spi/spi-esp32.c
+index 2417a37c1..06b6cb7b2 100644
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -145,6 +145,11 @@ esp32_spi_prepare_message(struct spi_controller *host, struct spi_message *msg)
+ 	if (device->mode & SPI_LSB_FIRST)
+ 		cr |= SPI_RD_BIT_ORDER | SPI_WR_BIT_ORDER;
+ 
++	/* All four data lines are outputs in quad mode: idle them high, as
++	 * the ESP-IDF SPI master does. */
++	if (device->mode & SPI_TX_QUAD)
++		cr |= SPI_Q_POL | SPI_D_POL | SPI_HOLD_POL | SPI_WP_POL;
++
+ 	esp32_spi_write(spi, SPI_CTRL_REG, cr);
+ 
+ 	/* SPI_MISC_REG */
+@@ -159,6 +164,8 @@ esp32_spi_prepare_message(struct spi_controller *host, struct spi_message *msg)
+ 	return 0;
+ }
+ 
++static void esp32_spi_wait_bit(struct esp32_spi *spi, u32 bit);
++
+ static void esp32_spi_set_cs(struct spi_device *device, bool is_high)
+ {
+ 	struct esp32_spi *spi = spi_controller_get_devdata(device->controller);
+@@ -166,7 +173,15 @@ static void esp32_spi_set_cs(struct spi_device *device, bool is_high)
+ 	u32 cr = is_high ? 0 : SPI_CS_KEEP_ACTIVE;
+ 
+ 	/* SPI_MISC_REG */
+-	cr |= (SPI_CS_DIS ^ BIT(cs));
++	/*
++	 * Clearing CS_KEEP_ACTIVE does not release CS, the controller only does
++	 * that when a transaction ends. Disable the CS line instead, which leaves
++	 * the pin idle. The next assert enables it again.
++	 */
++	if (is_high && !(device->mode & SPI_CS_HIGH))
++		cr |= SPI_CS_DIS;
++	else
++		cr |= (SPI_CS_DIS ^ BIT(cs));
+ 
+ 	if (device->mode & SPI_CS_HIGH)
+ 		cr |= FIELD_PREP(SPI_MASTER_CS_POL, BIT(cs));
+@@ -175,6 +190,14 @@ static void esp32_spi_set_cs(struct spi_device *device, bool is_high)
+ 		cr |= SPI_CK_IDLE_EDGE;
+ 
+ 	esp32_spi_write(spi, SPI_MISC_REG, cr);
++
++	/*
++	 * The SPI module only sees MISC after an update. Without one, CS keeps
++	 * its old level until the next transfer starts, so it stays low between
++	 * messages and never frames a command for the device.
++	 */
++	esp32_spi_write(spi, SPI_CMD_REG, SPI_UPDATE);
++	esp32_spi_wait_bit(spi, SPI_UPDATE);
+ }
+ 
+ static void esp32_spi_wait_bit(struct esp32_spi *spi, u32 bit)
+@@ -196,7 +219,6 @@ static void esp32_spi_prepare_transfer(struct esp32_spi *spi,
+ 				       unsigned int n_words)
+ {
+ 	u32 cr;
+-	unsigned int mode;
+ 
+ 	/* SPI_CLOCK_REG */
+ 	if (t->speed_hz != spi->speed_hz) {
+@@ -227,19 +249,30 @@ static void esp32_spi_prepare_transfer(struct esp32_spi *spi,
+ 				   t->bits_per_word * n_words - 1));
+ 
+ 	/* SPI_USER_REG */
+-	cr = SPI_CS_HOLD | SPI_CS_SETUP | SPI_DOUTDIN;
++	cr = SPI_CS_HOLD | SPI_CS_SETUP;
+ 
+ 	if ((device->mode & (SPI_CPOL | SPI_CPHA)) == SPI_CPOL ||
+ 	    (device->mode & (SPI_CPOL | SPI_CPHA)) == SPI_CPHA)
+ 		cr |= SPI_CK_OUT_EDGE;
+ 
+-	if (t->tx_buf)
++	if (t->tx_buf) {
+ 		cr |= SPI_USR_MOSI;
++		/* The data phase of a write can use two or four lines. */
++		if (t->tx_nbits == SPI_NBITS_DUAL)
++			cr |= SPI_FWRITE_DUAL;
++		else if (t->tx_nbits == SPI_NBITS_QUAD)
++			cr |= SPI_FWRITE_QUAD;
++	}
+ 	if (t->rx_buf)
+ 		cr |= SPI_USR_MISO;
+ 
+-	mode = max_t(unsigned int, t->rx_nbits, t->tx_nbits);
+-	WARN_ON(mode != SPI_NBITS_SINGLE);
++	/* Multi-line reads are not implemented, and a multi-line write is
++	 * half duplex. Single line transfers stay full duplex. */
++	WARN_ON(t->rx_buf && t->rx_nbits != SPI_NBITS_SINGLE);
++	if (t->tx_buf && t->tx_nbits > SPI_NBITS_SINGLE)
++		WARN_ON(t->rx_buf);
++	else
++		cr |= SPI_DOUTDIN;
+ 
+ 	esp32_spi_write(spi, SPI_USER_REG, cr);
+ }
+@@ -386,10 +419,10 @@ static int esp32_spi_probe(struct platform_device *pdev)
+ 	host->dev.of_node = np;
+ 	host->max_speed_hz = clk_get_rate(spi->clk);
+ 	host->bus_num = pdev->id;
++	/* Dual and quad writes are supported; multi-line reads are not. */
+ 	host->mode_bits = SPI_CPHA | SPI_CPOL |
+ 		SPI_CS_HIGH | SPI_LSB_FIRST |
+-		SPI_TX_DUAL | SPI_TX_QUAD |
+-		SPI_RX_DUAL | SPI_RX_QUAD;
++		SPI_TX_DUAL | SPI_TX_QUAD;
+ 	host->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
+ 	host->prepare_message = esp32_spi_prepare_message;
+ 	host->set_cs = esp32_spi_set_cs;
+-- 
+2.43.0
+
